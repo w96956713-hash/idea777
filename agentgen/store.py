@@ -11,6 +11,7 @@ agent (and through it customer) and every query used by agents filters on it.
 """
 
 import json
+import secrets
 import shutil
 import sqlite3
 import tempfile
@@ -156,6 +157,55 @@ CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    email TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL,  -- admin | member
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS org_settings (
+    customer_id INTEGER PRIMARY KEY REFERENCES customers(id),
+    monthly_budget_usd REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS operations (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    kind TEXT NOT NULL,
+    target_json TEXT NOT NULL,
+    status TEXT NOT NULL,  -- queued | running | succeeded | failed
+    result_json TEXT,
+    error TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_usage (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    purpose TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    usd REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY,
     agent_id INTEGER NOT NULL REFERENCES agents(id),
@@ -175,6 +225,10 @@ ADDED_COLUMNS = [
     ("records", "status", "TEXT NOT NULL DEFAULT 'open'"),
     ("records", "updated_at", "TEXT"),
     ("runs", "trigger_source", "TEXT NOT NULL DEFAULT 'manual'"),
+    ("runs", "duration_ms", "INTEGER"),
+    ("runs", "error", "TEXT"),
+    ("projects", "intake_json", "TEXT"),
+    ("projects", "amendments", "TEXT"),
 ]
 
 
@@ -187,22 +241,27 @@ def _now() -> str:
 
 
 def connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    # Each Store (connection) is used by one request or task at a time, but FastAPI may open and
+    # close it on different worker threads, so the same-thread check is relaxed.
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    if path != ":memory:":
+        conn.execute("PRAGMA journal_mode = WAL")  # readers don't block the background worker
     return conn
 
 
 class Store:
-    def __init__(self, path: str = "agentgen.db", data_dir: str | None = None):
+    def __init__(self, path: str = "agentgen.db", data_dir: str | None = None, migrate: bool = True):
         self.path = path
         self.conn = connect(path)
-        self.conn.executescript(SCHEMA)
-        for table, column, ddl in ADDED_COLUMNS:
-            cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
-            if column not in cols:
-                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-        self.conn.commit()
+        if migrate or path == ":memory:":
+            self.conn.executescript(SCHEMA)
+            for table, column, ddl in ADDED_COLUMNS:
+                cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                if column not in cols:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            self.conn.commit()
         if data_dir is None and path == ":memory:":
             data_dir = tempfile.mkdtemp(prefix="agentgen-data-")
             weakref.finalize(self, shutil.rmtree, data_dir, True)  # sandboxes clean up after themselves
@@ -210,6 +269,9 @@ class Store:
             data_dir = f"{path}.data"
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    def close(self) -> None:
+        self.conn.close()
 
     def _insert(self, sql: str, params: tuple) -> int:
         cur = self.conn.execute(sql, params)
@@ -233,11 +295,12 @@ class Store:
             "INSERT INTO requirements (customer_id, text, created_at) VALUES (?, ?, ?)", (customer_id, text, _now())
         )
 
-    def create_project(self, customer_id: int, title: str, intake: str) -> int:
+    def create_project(self, customer_id: int, title: str, intake: str, intake_fields: dict | None = None) -> int:
         return self._insert(
-            """INSERT INTO projects (customer_id, title, intake, stage, created_at, updated_at)
-               VALUES (?, ?, ?, 'intake', ?, ?)""",
-            (customer_id, title, intake, _now(), _now()),
+            """INSERT INTO projects (customer_id, title, intake, intake_json, stage, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'intake', ?, ?)""",
+            (customer_id, title, intake, json.dumps(intake_fields, ensure_ascii=False) if intake_fields else None,
+             _now(), _now()),
         )
 
     def project(self, project_id: int) -> sqlite3.Row:
@@ -252,8 +315,15 @@ class Store:
                FROM projects p JOIN customers c ON c.id = p.customer_id ORDER BY p.id"""
         ).fetchall()
 
+    def list_projects_for(self, customer_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT id, title, stage, agent_name, created_at, updated_at FROM projects
+               WHERE customer_id = ? ORDER BY id DESC""", (customer_id,)
+        ).fetchall()
+
     def update_project(self, project_id: int, **fields) -> None:
-        allowed = {"questions_json", "answers_json", "analysis_json", "agent_name", "stage"}
+        allowed = {"questions_json", "answers_json", "analysis_json", "agent_name", "stage", "intake", "intake_json",
+                   "amendments", "title"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"Can only update {sorted(allowed)}")
         sets = ", ".join(f"{k} = ?" for k in fields)
@@ -280,13 +350,18 @@ class Store:
     def save_version(self, customer_id: int, spec: AgentSpec, requirements_id: int | None = None) -> int:
         """Store a spec as the next version of its agent (creating the agent if new)."""
         row = self.conn.execute("SELECT * FROM agents WHERE name = ?", (spec.name,)).fetchone()
+        if row is not None and row["customer_id"] != customer_id:
+            # Agent names are global; never reveal or reuse another organisation's agent.
+            # A random suffix, so the name reveals nothing about other organisations' agents.
+            base = spec.name[:56]
+            while row is not None and row["customer_id"] != customer_id:
+                spec.name = f"{base}-{secrets.token_hex(3)}"
+                row = self.conn.execute("SELECT * FROM agents WHERE name = ?", (spec.name,)).fetchone()
         if row is None:
             agent_id = self._insert(
                 "INSERT INTO agents (customer_id, name, created_at) VALUES (?, ?, ?)", (customer_id, spec.name, _now())
             )
         else:
-            if row["customer_id"] != customer_id:
-                raise ValueError(f"Agent {spec.name!r} belongs to another customer")
             agent_id = row["id"]
         latest = self.conn.execute(
             "SELECT COALESCE(MAX(version), 0) AS v FROM agent_versions WHERE agent_id = ?", (agent_id,)
@@ -377,6 +452,13 @@ class Store:
         self._update("UPDATE agents SET deployed_version = ? WHERE name = ?", (version, agent_name))
         self.audit(self.agent(agent_name)["id"], None, "deployed", {"version": version})
 
+    def undeploy(self, agent_name: str) -> None:
+        """Stop the agent: no version is live, schedules and events stop creating jobs."""
+        agent = self.agent(agent_name)
+        self._update("UPDATE agents SET deployed_version = NULL WHERE id = ?", (agent["id"],))
+        self._update("UPDATE jobs SET status = 'cancelled' WHERE agent_id = ? AND status = 'pending'", (agent["id"],))
+        self.audit(agent["id"], None, "undeployed", {"version": agent["deployed_version"]})
+
     def deployed_spec(self, agent_name: str) -> tuple[AgentSpec, int]:
         version = self.agent(agent_name)["deployed_version"]
         if version is None:
@@ -394,10 +476,34 @@ class Store:
             (agent_id, title, content, _now()),
         )
 
-    def knowledge(self, agent_id: int) -> list[sqlite3.Row]:
-        return self.conn.execute(
+    def knowledge(self, agent_id: int) -> list[dict]:
+        """Documents an agent can read: its own knowledge docs plus its organisation's library."""
+        agent = self.agent_by_id(agent_id)
+        own = self.conn.execute(
             "SELECT id, title, content FROM knowledge_docs WHERE agent_id = ? ORDER BY id", (agent_id,)
         ).fetchall()
+        library = self.conn.execute(
+            "SELECT id, title, content FROM documents WHERE customer_id = ? ORDER BY id", (agent["customer_id"],)
+        ).fetchall() if agent else []
+        return ([{"id": f"K{r['id']}", "title": r["title"], "content": r["content"]} for r in own]
+                + [{"id": f"D{r['id']}", "title": r["title"], "content": r["content"]} for r in library])
+
+    def add_document(self, customer_id: int, title: str, content: str) -> int:
+        return self._insert(
+            "INSERT INTO documents (customer_id, title, content, created_at) VALUES (?, ?, ?, ?)",
+            (customer_id, title, content, _now()),
+        )
+
+    def documents(self, customer_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT id, title, LENGTH(content) AS size, created_at FROM documents WHERE customer_id = ? ORDER BY id",
+            (customer_id,),
+        ).fetchall()
+
+    def delete_document(self, customer_id: int, doc_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM documents WHERE id = ? AND customer_id = ?", (doc_id, customer_id))
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def customer_data_path(self, customer_id: int) -> Path:
         return self.data_dir / f"customer_{customer_id}.sqlite"
@@ -423,10 +529,12 @@ class Store:
             (agent_id, version, input_text, trigger_source, _now()),
         )
 
-    def finish_run(self, run_id: int, output: str, stop_reason: str, input_tokens: int, output_tokens: int) -> None:
+    def finish_run(self, run_id: int, output: str, stop_reason: str, input_tokens: int, output_tokens: int,
+                   duration_ms: int | None = None, error: str | None = None) -> None:
         self._update(
-            "UPDATE runs SET output = ?, stop_reason = ?, input_tokens = ?, output_tokens = ? WHERE id = ?",
-            (output, stop_reason, input_tokens, output_tokens, run_id),
+            """UPDATE runs SET output = ?, stop_reason = ?, input_tokens = ?, output_tokens = ?, duration_ms = ?,
+               error = ? WHERE id = ?""",
+            (output, stop_reason, input_tokens, output_tokens, duration_ms, error, run_id),
         )
 
     def audit(self, agent_id: int, run_id: int | None, event: str, data: dict) -> None:
@@ -570,7 +678,7 @@ class Store:
         agent_id = sandbox._insert(
             "INSERT INTO agents (customer_id, name, created_at) VALUES (?, ?, ?)", (customer_id, agent_name, _now())
         )
-        for doc in self.knowledge(agent["id"]):
+        for doc in self.knowledge(agent["id"]):  # agent docs and the organisation's library
             sandbox.add_knowledge(agent_id, doc["title"], doc["content"])
         for rec in self.conn.execute("SELECT * FROM records WHERE agent_id = ?", (agent["id"],)):
             sandbox.add_record(agent_id, rec["table_name"], json.loads(rec["data_json"]), rec["status"])
@@ -580,3 +688,181 @@ class Store:
         for ds in self.datasets(agent["customer_id"]):
             sandbox.register_dataset(customer_id, ds["name"], json.loads(ds["columns_json"]), ds["row_count"])
         return sandbox, agent_id
+
+    # --- users & sessions -----------------------------------------------------------------
+
+    def create_user(self, customer_id: int, email: str, name: str, password_hash: str, role: str) -> int:
+        return self._insert(
+            "INSERT INTO users (customer_id, email, name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (customer_id, email.lower(), name, password_hash, role, _now()),
+        )
+
+    def user_by_email(self, email: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM users WHERE email = ?", (email.lower(),)).fetchone()
+
+    def customer_exists(self, name: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM customers WHERE name = ?", (name,)).fetchone() is not None
+
+    def create_session(self, token_hash: str, user_id: int, expires_at: str) -> None:
+        self._update("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+                     (token_hash, user_id, expires_at, _now()))
+
+    def session_user(self, token_hash: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """SELECT u.*, c.name AS organization FROM sessions s JOIN users u ON u.id = s.user_id
+               JOIN customers c ON c.id = u.customer_id WHERE s.token_hash = ? AND s.expires_at > ?""",
+            (token_hash, _now()),
+        ).fetchone()
+
+    def delete_session(self, token_hash: str) -> None:
+        self._update("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+    # --- organisation settings & spend ----------------------------------------------------
+
+    def monthly_budget(self, customer_id: int, default: float) -> float:
+        row = self.conn.execute("SELECT monthly_budget_usd FROM org_settings WHERE customer_id = ?",
+                                (customer_id,)).fetchone()
+        return row["monthly_budget_usd"] if row else default
+
+    def set_monthly_budget(self, customer_id: int, usd: float) -> None:
+        self._update(
+            """INSERT INTO org_settings (customer_id, monthly_budget_usd, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT (customer_id) DO UPDATE SET monthly_budget_usd = excluded.monthly_budget_usd,
+               updated_at = excluded.updated_at""",
+            (customer_id, usd, _now()),
+        )
+
+    def record_usage(self, customer_id: int, purpose: str, model: str, input_tokens: int, output_tokens: int,
+                     usd: float) -> None:
+        self._insert(
+            """INSERT INTO model_usage (customer_id, purpose, model, input_tokens, output_tokens, usd, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (customer_id, purpose, model, input_tokens, output_tokens, usd, _now()),
+        )
+
+    def month_spend(self, customer_id: int) -> float:
+        month_start = utcnow().replace(day=1, hour=0, minute=0, second=0).isoformat()
+        return self.conn.execute(
+            "SELECT COALESCE(SUM(usd), 0) FROM model_usage WHERE customer_id = ? AND created_at >= ?",
+            (customer_id, month_start),
+        ).fetchone()[0]
+
+    def usage_by_purpose(self, customer_id: int, since: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT purpose, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens,
+                      SUM(output_tokens) AS output_tokens, SUM(usd) AS usd
+               FROM model_usage WHERE customer_id = ? AND created_at >= ? GROUP BY purpose ORDER BY usd DESC""",
+            (customer_id, since),
+        ).fetchall()
+
+    # --- background operations ------------------------------------------------------------
+
+    def create_operation(self, customer_id: int, kind: str, target: dict, created_by: str) -> int:
+        return self._insert(
+            """INSERT INTO operations (customer_id, kind, target_json, status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, 'queued', ?, ?, ?)""",
+            (customer_id, kind, json.dumps(target), created_by, _now(), _now()),
+        )
+
+    def update_operation(self, op_id: int, status: str, result: dict | None = None, error: str | None = None) -> None:
+        self._update(
+            "UPDATE operations SET status = ?, result_json = ?, error = ?, updated_at = ? WHERE id = ?",
+            (status, json.dumps(result, default=str) if result is not None else None, error, _now(), op_id),
+        )
+
+    def operation(self, op_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM operations WHERE id = ?", (op_id,)).fetchone()
+
+    def operations_for(self, customer_id: int, kind: str | None = None, target_key: str | None = None,
+                       target_value=None, limit: int = 20) -> list[sqlite3.Row]:
+        rows = self.conn.execute(
+            "SELECT * FROM operations WHERE customer_id = ? ORDER BY id DESC LIMIT 200", (customer_id,)
+        ).fetchall()
+        out = []
+        for r in rows:
+            if kind and r["kind"] != kind:
+                continue
+            if target_key and json.loads(r["target_json"]).get(target_key) != target_value:
+                continue
+            out.append(r)
+        return out[:limit]
+
+    def fail_interrupted_operations(self) -> None:
+        """Operations still running when the server stopped will never finish."""
+        self._update("UPDATE operations SET status = 'failed', error = 'Interrupted by a server restart', "
+                     "updated_at = ? WHERE status IN ('queued', 'running')", (_now(),))
+
+    # --- organisation-scoped queries for the web app ---------------------------------------
+
+    def agents_for(self, customer_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT a.*, (SELECT MAX(version) FROM agent_versions v WHERE v.agent_id = a.id) AS latest_version,
+                      (SELECT status FROM agent_versions v WHERE v.agent_id = a.id ORDER BY version DESC LIMIT 1)
+                          AS latest_status,
+                      (SELECT MAX(created_at) FROM runs r WHERE r.agent_id = a.id) AS last_run_at
+               FROM agents a WHERE a.customer_id = ? ORDER BY a.name""",
+            (customer_id,),
+        ).fetchall()
+
+    def agent_scoped(self, customer_id: int, agent_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM agents WHERE id = ? AND customer_id = ?",
+                                 (agent_id, customer_id)).fetchone()
+
+    def versions(self, agent_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT v.id, v.version, v.status, v.created_at,
+                      (SELECT approved_by FROM approvals ap WHERE ap.agent_version_id = v.id ORDER BY id DESC LIMIT 1)
+                          AS approved_by,
+                      (SELECT created_at FROM approvals ap WHERE ap.agent_version_id = v.id ORDER BY id DESC LIMIT 1)
+                          AS approved_at,
+                      (SELECT pass_rate FROM test_runs t WHERE t.agent_version_id = v.id ORDER BY id DESC LIMIT 1)
+                          AS pass_rate
+               FROM agent_versions v WHERE v.agent_id = ? ORDER BY v.version DESC""",
+            (agent_id,),
+        ).fetchall()
+
+    def test_reports(self, agent_name: str, version: int, limit: int = 10) -> list[sqlite3.Row]:
+        row = self._version_row(agent_name, version)
+        return self.conn.execute(
+            "SELECT id, pass_rate, passed, report_json, created_at FROM test_runs WHERE agent_version_id = ? "
+            "ORDER BY id DESC LIMIT ?", (row["id"], limit),
+        ).fetchall()
+
+    def runs_for(self, customer_id: int, agent_id: int | None = None, limit: int = 100) -> list[sqlite3.Row]:
+        sql = """SELECT r.*, a.name AS agent FROM runs r JOIN agents a ON a.id = r.agent_id
+                 WHERE a.customer_id = ?"""
+        params: list = [customer_id]
+        if agent_id is not None:
+            sql += " AND r.agent_id = ?"
+            params.append(agent_id)
+        return self.conn.execute(sql + " ORDER BY r.id DESC LIMIT ?", (*params, limit)).fetchall()
+
+    def run_scoped(self, customer_id: int, run_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """SELECT r.*, a.name AS agent FROM runs r JOIN agents a ON a.id = r.agent_id
+               WHERE r.id = ? AND a.customer_id = ?""", (run_id, customer_id),
+        ).fetchone()
+
+    def run_events(self, run_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM audit_log WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
+
+    def actions_for(self, customer_id: int, status: str | None = "pending") -> list[sqlite3.Row]:
+        sql = """SELECT p.*, a.name AS agent FROM pending_actions p JOIN agents a ON a.id = p.agent_id
+                 WHERE a.customer_id = ?"""
+        params: list = [customer_id]
+        if status:
+            sql += " AND p.status = ?"
+            params.append(status)
+        return self.conn.execute(sql + " ORDER BY p.id DESC LIMIT 200", params).fetchall()
+
+    def jobs_for(self, customer_id: int, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT j.*, a.name AS agent FROM jobs j JOIN agents a ON a.id = j.agent_id
+               WHERE a.customer_id = ? ORDER BY j.id DESC LIMIT ?""", (customer_id, limit),
+        ).fetchall()
+
+    def outputs_for_run(self, agent_id: int, since: str) -> dict:
+        """What an agent produced since a time (records, outbox, escalations) - for run details."""
+        q = lambda t: [dict(r) for r in self.conn.execute(
+            f"SELECT * FROM {t} WHERE agent_id = ? AND created_at >= ? ORDER BY id", (agent_id, since))]
+        return {"records": q("records"), "outbox": q("outbox"), "escalations": q("escalations")}

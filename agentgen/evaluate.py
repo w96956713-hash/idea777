@@ -7,8 +7,9 @@ them, and `fail_tools` simulates outages. A case passes only if:
   2. the run finished normally (no turn/token limit, no refusal);
   3. a grader model confirms the behaviour matches the expected behaviour.
 
-Release gate: pass rate >= threshold, every safety case (permission, unauthorised action)
-passes, and no case that passed in the last passed version now fails. Cases from that
+Release gate: pass rate >= threshold, the suite contains safety cases (permission,
+unauthorised action) and every one of them passes, and no case that passed in the last
+passed version now fails. Cases from that
 version are carried forward automatically as a regression suite.
 """
 
@@ -16,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 
 from pydantic import BaseModel
 
-from .llm import DEFAULT_MODEL, cost_usd, structured
+from .llm import DEFAULT_MODEL, BudgetExceeded, cost_usd, structured
 from .runtime import AgentRuntime, approve_all, transcript
 from .spec import SAFETY_CATEGORIES, AgentSpec, TestCase
 from .store import Store
@@ -49,6 +50,7 @@ class CaseResult:
     output_tokens: int
     usd: float | None
     transcript: str
+    error: str = ""
 
 
 @dataclass
@@ -80,12 +82,20 @@ class EvalReport:
         return sum(costs) / len(costs) if costs else None
 
     @property
+    def has_safety_cases(self) -> bool:
+        return any(c.category in SAFETY_CATEGORIES for c in self.cases)
+
+    @property
     def passed(self) -> bool:
-        return (bool(self.cases) and self.pass_rate >= self.threshold
+        return (bool(self.cases) and self.pass_rate >= self.threshold and self.has_safety_cases
                 and not self.safety_failures and not self.regressions)
 
     def blockers(self) -> list[str]:
         out = []
+        if not self.cases:
+            out.append("there are no test cases")
+        if self.cases and not self.has_safety_cases:
+            out.append("no permission or unauthorised-action test cases")
         if self.pass_rate < self.threshold:
             out.append(f"pass rate {self.pass_rate:.0%} is below {self.threshold:.0%}")
         if self.safety_failures:
@@ -99,6 +109,7 @@ class EvalReport:
             "agent": self.agent, "version": self.version, "pass_rate": self.pass_rate, "threshold": self.threshold,
             "passed": self.passed, "blockers": self.blockers(), "regressions": self.regressions,
             "safety_failures": self.safety_failures, "skipped_carried": self.skipped_carried,
+            "has_safety_cases": self.has_safety_cases, "errors": [c.name for c in self.cases if c.error],
             "over_budget": self.over_budget, "avg_usd_per_run": self.avg_usd_per_run,
             "cases": [asdict(c) for c in self.cases],
         }
@@ -125,10 +136,7 @@ def judge(client, spec: AgentSpec, case: TestCase, run_transcript: str, model: s
         f"Expected behaviour:\n{case.expected_behavior}\n\n"
         f"Transcript:\n{run_transcript}"
     )
-    try:
-        return structured(client, Verdict, JUDGE_SYSTEM, prompt, model=model, effort="medium", max_tokens=8000)
-    except RuntimeError as e:
-        return Verdict(reasoning=f"Grader produced no verdict: {e}", passed=False)
+    return structured(client, Verdict, JUDGE_SYSTEM, prompt, model=model, effort="medium", max_tokens=8000)
 
 
 def build_suite(store: Store, agent_name: str, spec: AgentSpec, version: int) -> tuple[list[tuple[TestCase, bool]], list[str], int | None]:
@@ -160,16 +168,31 @@ def evaluate(client, store: Store, agent_name: str, version: int | None = None,
         sandbox, sandbox_agent_id = store.sandbox_for(agent_name)
         runtime = AgentRuntime(client, sandbox, sandbox_agent_id, spec, version,
                                approver=approve_all, test_case=case, trigger_source="test")
-        run = runtime.run(case.input)
+        try:
+            run = runtime.run(case.input)
+        except Exception as e:  # the run itself failed (API error, budget): the case fails with the reason
+            error = f"{type(e).__name__}: {e}"
+            result = CaseResult(case.name, case.category, carried, False, "run failed", "", 0, 0, None, "", error)
+            results.append(result)
+            if on_case:
+                on_case(result)
+            if isinstance(e, BudgetExceeded):
+                break  # every further case would fail the same way
+            continue
         run_transcript = transcript(run)
         problems = [p for p in [check_tools(case, run.called, run.attempted)] if p]
         if run.stop_reason in ABNORMAL_STOPS:
             problems.append(f"run ended with {run.stop_reason}")
-        verdict = judge(client, spec, case, run_transcript)
+        error = ""
+        try:
+            verdict = judge(client, spec, case, run_transcript)
+        except Exception as e:
+            error = f"Grader failed: {type(e).__name__}: {e}"
+            verdict = Verdict(reasoning="No verdict (grader error).", passed=False)
         result = CaseResult(
-            case.name, case.category, carried, verdict.passed and not problems, "; ".join(problems) or "ok",
-            verdict.reasoning, run.input_tokens, run.output_tokens,
-            cost_usd(spec.model, run.input_tokens, run.output_tokens), run_transcript,
+            case.name, case.category, carried, verdict.passed and not problems and not error,
+            "; ".join(problems) or "ok", verdict.reasoning, run.input_tokens, run.output_tokens,
+            cost_usd(spec.model, run.input_tokens, run.output_tokens), run_transcript, error,
         )
         results.append(result)
         if on_case:

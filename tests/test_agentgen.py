@@ -198,10 +198,16 @@ def test_http_request(router, monkeypatch):
     with pytest.raises(ToolFailure, match="secret FASTIGHETSDRIFT_TOKEN"):
         http.run({"address": "a", "apartment": "1", "problem": "p", "priority": "urgent", "case_id": "1"},
                  ctx_for(router, tool))
-    with pytest.raises(ToolFailure, match="tests never call real systems"):
+    with pytest.raises(ToolFailure, match="never call real systems"):
         http.run({}, ctx_for(router, tool, sandbox=True))
 
-    monkeypatch.setenv("FASTIGHETSDRIFT_TOKEN", "secret-token")
+    monkeypatch.setenv("FASTIGHETSDRIFT_TOKEN", "platform-env-is-never-used")
+    with pytest.raises(ToolFailure, match="not set for this organisation"):
+        http.run({"address": "a", "apartment": "1", "problem": "p", "priority": "urgent", "case_id": "1"},
+                 ctx_for(router, tool))
+    cid = router.agent("service-request-router")["customer_id"]
+    monkeypatch.setenv(components.secret_env_name(cid, "FASTIGHETSDRIFT_TOKEN"), "secret-token")
+    monkeypatch.setattr(components, "_check_public_host", lambda host: None)
     sent = {}
 
     class Resp(io.BytesIO):
@@ -231,6 +237,9 @@ def test_http_path_params_cannot_change_host():
         ConfigItem(key="path", value="/customers/{id}")])
     req = CATALOG["http_request"].build_request({"id": "../../evil.example/x", "q": "a b"}, tool.config_dict())
     assert req.full_url.startswith("https://api.example/v1/customers/..%2F..%2Fevil.example%2Fx?q=a+b")
+    for host in ("localhost", "127.0.0.1", "10.0.0.5", "169.254.169.254"):
+        with pytest.raises(ToolFailure, match="internal network"):
+            components._check_public_host(host)
 
 
 def test_record_components(router):

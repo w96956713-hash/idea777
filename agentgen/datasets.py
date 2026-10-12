@@ -6,6 +6,7 @@ the tables listed in the tool's config.
 """
 
 import csv
+import io
 import json
 import re
 import sqlite3
@@ -36,17 +37,30 @@ def _coerce(values: list[str]) -> tuple[str, list]:
     return "TEXT", [v if v != "" else None for v in values]
 
 
+MAX_IMPORT_ROWS = 200_000
+
+
 def import_csv(store: Store, customer_id: int, name: str, csv_path: str | Path) -> tuple[list[str], int]:
     """Create or replace dataset `name` for the customer from a CSV file."""
+    return import_csv_text(store, customer_id, name, Path(csv_path).read_text(encoding="utf-8-sig"))
+
+
+def import_csv_text(store: Store, customer_id: int, name: str, text: str) -> tuple[list[str], int]:
+    """Create or replace dataset `name` for the customer from CSV text."""
     if not _NAME.match(name):
         raise ValueError("Dataset names use lowercase letters, digits and underscores, starting with a letter")
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        sample = f.read(4096)
-        f.seek(0)
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t") if sample else csv.excel
-        rows = list(csv.reader(f, dialect))
-    if not rows:
-        raise ValueError(f"{csv_path} is empty")
+    text = text.lstrip("\ufeff")
+    if not text.strip():
+        raise ValueError("The CSV file is empty")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    rows = [r for r in csv.reader(io.StringIO(text), dialect) if any(cell.strip() for cell in r)]
+    if len(rows) < 2:
+        raise ValueError("The CSV needs a header row and at least one data row")
+    if len(rows) > MAX_IMPORT_ROWS:
+        raise ValueError(f"Too many rows (limit {MAX_IMPORT_ROWS})")
     header, body = rows[0], rows[1:]
     columns, seen = [], set()
     for h in header:
@@ -55,7 +69,7 @@ def import_csv(store: Store, customer_id: int, name: str, csv_path: str | Path) 
             col += "_2"
         seen.add(col)
         columns.append(col)
-    body = [r + [""] * (len(columns) - len(r)) for r in body]
+    body = [(r + [""] * (len(columns) - len(r)))[:len(columns)] for r in body]
     typed = [_coerce([r[i] for r in body]) for i in range(len(columns))]
 
     conn = sqlite3.connect(store.customer_data_path(customer_id))
@@ -115,3 +129,28 @@ def query(store: Store, customer_id: int, allowed: list[str], sql: str) -> str:
     if truncated:
         out.append(f"(showing first {MAX_ROWS} rows; add filters or aggregates)")
     return "\n".join(out)
+
+
+def preview(store: Store, customer_id: int, name: str, limit: int = 20) -> dict:
+    """Column names and the first rows of a dataset (for people, not agents)."""
+    if not _NAME.match(name) or name not in {d["name"] for d in store.datasets(customer_id)}:
+        raise KeyError(f"No dataset {name!r}")
+    conn = sqlite3.connect(f"file:{store.customer_data_path(customer_id)}?mode=ro", uri=True)
+    try:
+        cur = conn.execute(f'SELECT * FROM "{name}" LIMIT ?', (limit,))
+        return {"columns": [d[0] for d in cur.description], "rows": [list(r) for r in cur.fetchall()]}
+    finally:
+        conn.close()
+
+
+def delete(store: Store, customer_id: int, name: str) -> None:
+    if not _NAME.match(name) or name not in {d["name"] for d in store.datasets(customer_id)}:
+        raise KeyError(f"No dataset {name!r}")
+    conn = sqlite3.connect(store.customer_data_path(customer_id))
+    try:
+        conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+        conn.commit()
+    finally:
+        conn.close()
+    store.conn.execute("DELETE FROM datasets WHERE customer_id = ? AND name = ?", (customer_id, name))
+    store.conn.commit()

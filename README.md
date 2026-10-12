@@ -19,6 +19,47 @@ intake ─► discovery questions ─► analysis ─► design ─► validate 
                                   cost)
 ```
 
+## Run the web application
+
+```bash
+pip install -e '.[dev]'
+export ANTHROPIC_API_KEY=...          # needed to generate, test and run agents (server-side only)
+agentgen serve                         # http://127.0.0.1:8000
+```
+
+Create an account (this creates your organisation), then:
+
+1. **Data & integrations**: upload CSV exports (e.g. `examples/sales_insights/data/orders.csv` and
+   `products.csv`) and any policy documents.
+2. **Create an agent**: describe the company, the problem, the current workflow, the desired outcome,
+   systems and constraints.
+3. On the project page: **Generate questions** → answer → **Analyse requirements** → add corrections →
+   **Generate agent**. The designer only connects the agent to data you actually uploaded.
+4. On the agent: review **Overview** (responsibilities, workflow, tools, permissions, data, limits, tests),
+   adjust **Configuration** (each save is a new version), **Run test suite**, **Run a task** in the sandbox.
+5. **Versions & deployment**: approve a version whose tests passed (safety cases included) and deploy it.
+   Then run live tasks, send events, and watch **Execution history**, **Approvals** and **Monitoring**.
+
+Settings has the monthly model budget (default $25); every model call is metered against it.
+`--no-worker` disables the background worker; `AGENTGEN_ALLOW_SIGNUP=0` disables sign-up;
+`AGENTGEN_SECURE_COOKIES=1` when served over HTTPS.
+
+**Real vs simulated.** Agent runs, tools, SQL over your data, records, drafts, memory, tests, approvals,
+the worker and all metrics are real. In sandbox runs and tests, external APIs are simulated (fixtures or
+a clear "not called" result) and actions only touch a copy of the data. Messages are written to the outbox;
+no delivery connector exists, so nothing is actually sent. Live external API calls need the organisation's
+secret set on the server (`AGENTGEN_ORG<id>_<NAME>`, shown in Settings).
+
+## Tests
+
+```bash
+pytest                                         # 33 tests, offline, scripted model
+AGENTGEN_UI_TEST=1 pytest tests/test_ui.py     # browser test of the full journey (Node.js + Playwright)
+```
+
+The scripted model (`tests/fake_model.py`) stands in for Claude in tests only. Everything else — the
+database, pipeline, validation, runtime, tools, evaluation, approvals, worker and UI — is the real code.
+
 ## What an agent can be built from
 
 | Capability | Component(s) | Risk class |
@@ -102,11 +143,14 @@ These are stated honestly so nothing is mistaken for a working feature:
   connectors (Microsoft Graph, Slack, SMS) are not built.
 - **Inbound connectors.** Webhooks/inbox listeners that turn real emails or portal submissions into
   events (`agentgen trigger` is the entry point they will call).
-- **Web dashboard and HTTP API.** The CLI is the interface today. The earlier browser demo predates
-  this architecture and is email-centric; don't use it to judge the product.
-- **Platform user roles**, Postgres with row-level security, a secret manager, OAuth, and semantic
-  document search. Planned for stage 2 (see the architecture doc).
+- **Production hosting.** "Deployed" means running on the server you started with `agentgen serve`
+  (local deployment with a built-in worker). There is no managed hosting, scaling or high availability.
+- **Production-grade tenancy and auth.** Organisations are isolated in application code (every query is
+  scoped) and datasets are in per-organisation files; there is no Postgres row-level security, SSO,
+  email verification, password reset or audit export. Postgres, a secret manager, OAuth and semantic
+  document search are planned (see the architecture doc).
+- The earlier browser demo artifact predates this architecture and is email-centric; it is not the product.
 - **Data residency.** It depends on where you deploy and which model provider agreement applies; no
   guarantee is implied by this code.
-- **Real-API verification.** The offline tests use a scripted model. Run `agentgen test` with an API
-  key to measure real behaviour.
+- **Real-model verification.** No API key was available while building this, so no real Claude call has
+  been made. The offline tests use a scripted model; run the journey with a key to measure real quality.

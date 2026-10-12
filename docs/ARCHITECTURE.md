@@ -166,3 +166,19 @@ Implemented and covered by offline tests (`pytest`, 24 tests):
 Not yet verified against the live API: model behaviour, structured-output acceptance of the larger schemas, and real HTTP connectors. The first live run should be `agentgen test` on both examples.
 
 Next priorities (stage 2, in order): run both examples live and fix what fails; HTTP API + dashboard (projects, test reports, approvals queue, monitoring); Postgres with row-level security and user roles; the first delivery and inbound connectors chosen by pilot demand; the improvement loop from failed runs to proposed spec changes.
+
+## 8. Status after the web application change
+
+The engine now has a web application (`agentgen/web/`, started with `agentgen serve`):
+
+- **API** (FastAPI): accounts and sessions (scrypt passwords, HttpOnly SameSite=Strict cookies, CSRF header check, login throttling, security headers incl. CSP); every endpoint scoped to the user's organisation; administrators approve, deploy and change settings.
+- **Background operations** for model work (questions, analysis, design, tests, runs) that the browser polls; interrupted operations are marked failed on restart.
+- **Metering and spending limit**: every model call goes through a client that refuses calls once the organisation's monthly budget is spent and records tokens and cost by purpose.
+- **Local deployment**: a worker thread runs deployed agents' schedules, events and follow-ups; unattended actions that need approval are queued for a person.
+- **Sandbox runs**: act on a copy of the data with external APIs simulated, but are recorded in the real execution history.
+- **Security fixes found while building**: organisation-scoped secrets (a spec can no longer name the server's own credentials), SSRF blocking for internal addresses, random suffixes for agent names that collide across organisations.
+- **UI** (dependency-free JavaScript): overview, projects with the six-step requirements flow, agent overview/configuration/tests/run/deployment/activity, testing, deployed agents, execution history with run details, approvals, monitoring, data & integrations, settings.
+
+Verified offline: 33 pytest tests (engine + HTTP API, including isolation, approval enforcement, budget, failures) and a 13-step browser test of the full journey. Not verified: behaviour with the real model (no API key was available).
+
+Highest remaining production risks: unverified real-model quality and cost; SQLite and in-process worker (single server, no HA); application-level tenancy only; no delivery or inbound connectors; no SSO, password reset or email verification; secrets via environment variables; no backups or data-retention tooling.

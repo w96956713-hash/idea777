@@ -7,10 +7,15 @@ asks a person directly; unattended runs (schedules, events) queue the action for
 decide later (see execute_queued_action).
 
 In test mode (a TestCase is passed) tools listed in `fail_tools` fail with a simulated
-outage and `fixtures` replace what external systems would return.
+outage and `fixtures` replace what external systems would return. In sandbox mode (always on
+in test mode) external APIs are never called.
+
+Data and logs can live in different stores: a sandbox run acts on a copy of the data
+(`store`) but is recorded in the real history (`log_store`).
 """
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -94,10 +99,14 @@ def build_system_prompt(spec: AgentSpec) -> str:
 
 class AgentRuntime:
     def __init__(self, client, store: Store, agent_id: int, spec: AgentSpec, version: int,
-                 approver: Approver = deny_all, test_case: TestCase | None = None, trigger_source: str = "manual"):
+                 approver: Approver = deny_all, test_case: TestCase | None = None, trigger_source: str = "manual",
+                 sandbox: bool = False, log_store: Store | None = None, log_agent_id: int | None = None):
         self.client = client
         self.store = store
         self.agent_id = agent_id
+        self.sandbox = sandbox or test_case is not None
+        self.log = log_store or store
+        self.log_agent_id = log_agent_id if log_store is not None else agent_id
         self.customer_id = store.agent_by_id(agent_id)["customer_id"]
         self.spec = spec
         self.version = version
@@ -113,16 +122,33 @@ class AgentRuntime:
     def _context(self, tool, run_id) -> Context:
         retention = self.spec.memory.retention_days if self.spec.memory.enabled else 0
         return Context(self.store, self.agent_id, self.customer_id, tool, run_id,
-                       sandbox=self.test_case is not None, memory_retention_days=retention)
+                       sandbox=self.sandbox, memory_retention_days=retention)
 
     def run(self, user_input: str, history: list | None = None) -> RunResult:
         messages = list(history or []) + [{"role": "user", "content": user_input}]
-        run_id = self.store.start_run(self.agent_id, self.version, user_input, self.trigger_source)
+        run_id = self.log.start_run(self.log_agent_id, self.version, user_input, self.trigger_source)
         result = RunResult(text="", stop_reason="", run_id=run_id, messages=messages)
-        self.store.audit(self.agent_id, run_id, "run_started", {"version": self.version, "input": user_input[:2000]})
+        self.log.audit(self.log_agent_id, run_id, "run_started",
+                       {"version": self.version, "input": user_input[:2000], "sandbox": self.sandbox})
+        started = time.monotonic()
+        try:
+            self._loop(result, messages, run_id, user_input)
+        except Exception as e:  # model API errors, budget limits: record the failure, then report it
+            result.stop_reason = "error"
+            error = f"{type(e).__name__}: {e}"
+            self.log.finish_run(run_id, result.text, "error", result.input_tokens, result.output_tokens,
+                                int((time.monotonic() - started) * 1000), error[:2000])
+            self.log.audit(self.log_agent_id, run_id, "run_failed", {"error": error[:2000]})
+            raise
+        self.log.finish_run(run_id, result.text, result.stop_reason, result.input_tokens, result.output_tokens,
+                            int((time.monotonic() - started) * 1000))
+        self.log.audit(self.log_agent_id, run_id, "run_finished",
+                       {"stop_reason": result.stop_reason, "output": result.text[:2000]})
+        return result
+
+    def _loop(self, result: RunResult, messages: list, run_id: int, user_input: str) -> None:
         limits = self.spec.limits
         response = None
-
         for _ in range(max(1, limits.max_turns)):
             response = self.client.beta.messages.create(
                 model=self.spec.model,
@@ -134,8 +160,10 @@ class AgentRuntime:
                 cache_control={"type": "ephemeral"},
                 **fallback_kwargs(self.spec.model),
             )
-            result.input_tokens += response.usage.input_tokens
-            result.output_tokens += response.usage.output_tokens
+            usage = response.usage
+            result.input_tokens += (usage.input_tokens + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+                                    + (getattr(usage, "cache_creation_input_tokens", 0) or 0))
+            result.output_tokens += usage.output_tokens
             result.stop_reason = response.stop_reason
             # Full content (incl. thinking blocks) is appended unchanged: history stays append-only.
             messages.append({"role": "assistant", "content": response.content})
@@ -162,33 +190,35 @@ class AgentRuntime:
         if result.stop_reason in ("budget_exceeded", "max_turns"):
             self.store.add_escalation(self.agent_id, f"Run stopped: {result.stop_reason}",
                                       f"Run #{run_id} hit its limit before finishing. Input: {user_input[:500]}")
-        self.store.finish_run(run_id, result.text, result.stop_reason, result.input_tokens, result.output_tokens)
-        self.store.audit(self.agent_id, run_id, "run_finished",
-                         {"stop_reason": result.stop_reason, "output": result.text[:2000]})
-        return result
 
     def _execute(self, name: str, args: dict, run_id: int) -> ToolCall:
         tool = self.spec.tool(name)
         if tool is None or tool.component not in CATALOG:  # the model only sees allowed tools; never trust that
-            self.store.audit(self.agent_id, run_id, "tool_blocked", {"tool": name, "input": args})
+            self.log.audit(self.log_agent_id, run_id, "tool_blocked", {"tool": name, "input": args})
             return ToolCall(name, args, f"Error: tool {name!r} is not available to this agent.", "denied", True)
 
         call = ToolCall(name, args, "")
         if tool.requires_approval:
             decision = self.approver(name, args)
             call.approval = "queued" if decision == "queued" else ("approved" if decision is True else "denied")
-            self.store.audit(self.agent_id, run_id, "approval", {"tool": name, "input": args, "decision": call.approval})
+            self.log.audit(self.log_agent_id, run_id, "approval", {"tool": name, "input": args, "decision": call.approval})
             if call.approval == "denied":
                 call.result = "A person denied this action. Do not retry it."
                 return call
             if call.approval == "queued":
+                if self.sandbox:  # never queue a real action from a sandbox run
+                    call.approval, call.result = "denied", "Sandbox run: actions needing approval are not queued."
+                    return call
                 action_id = self.store.queue_action(self.agent_id, run_id, name, args)
                 call.result = f"Submitted for a person's approval (action #{action_id}). It has not happened yet. Do not repeat it."
                 return call
 
+        started = time.monotonic()
         call.result, call.error = self._run_component(tool, args, run_id)
-        self.store.audit(self.agent_id, run_id, "tool_error" if call.error else "tool_call",
-                         {"tool": name, "input": args, "result": call.result[:2000]})
+        self.log.audit(self.log_agent_id, run_id, "tool_error" if call.error else "tool_call",
+                       {"tool": name, "input": args, "result": call.result[:4000],
+                        "duration_ms": int((time.monotonic() - started) * 1000), "approval": call.approval,
+                        "simulated": self.sandbox and tool.component == "http_request"})
         return call
 
     def _run_component(self, tool, args, run_id) -> tuple[str, bool]:

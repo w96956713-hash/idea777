@@ -59,6 +59,11 @@ def agent_metrics(store: Store, agent_name: str, days: int = 30) -> dict:
         "output_tokens": sum(r["output_tokens"] for r in runs),
         "cost_usd": round(total_cost, 4),
         "cost_usd_per_run": round(total_cost / n, 4) if n else None,
+        "avg_duration_ms": (sum(r["duration_ms"] for r in runs if r["duration_ms"] is not None)
+                            / max(1, sum(1 for r in runs if r["duration_ms"] is not None)))
+                           if any(r["duration_ms"] is not None for r in runs) else None,
+        "by_source": dict(Counter(r["trigger_source"] for r in runs)),
+        "failed_runs": sum(1 for r in runs if r["stop_reason"] not in ("end_turn", None)),
         "cost_note": "list prices, before prompt-caching discounts" + ("; some models unpriced" if unknown_cost else ""),
         "by_version": {k: {**v, "completion_rate": v["completed"] / v["runs"]} for k, v in sorted(by_version.items())},
     }

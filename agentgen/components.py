@@ -12,10 +12,12 @@ configured `http_request` tool (no code) or a new Component subclass here.
 """
 
 import ast
+import ipaddress
 import json
 import operator
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -46,6 +48,34 @@ class Context:
 
 class ToolFailure(Exception):
     """A tool could not complete; the message is shown to the agent."""
+
+
+_SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+
+
+def secret_env_name(customer_id: int, name: str) -> str:
+    """Secrets are scoped per organisation: a spec names `CRM_TOKEN`, the server reads
+    `AGENTGEN_ORG<id>_CRM_TOKEN`. A spec can never reach another organisation's secrets or the
+    platform's own credentials (e.g. the model API key)."""
+    return f"AGENTGEN_ORG{customer_id}_{name}"
+
+
+def org_secret(customer_id: int, name: str) -> str | None:
+    if not _SECRET_NAME.match(name or ""):
+        return None
+    return os.environ.get(secret_env_name(customer_id, name))
+
+
+def _check_public_host(host: str) -> None:
+    """Refuse requests to loopback, private, link-local or reserved addresses (SSRF)."""
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise ToolFailure(f"cannot resolve host {host}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ToolFailure(f"requests to internal network addresses are not allowed ({host})")
 
 
 def _schema(properties: dict, required: list[str] | None = None) -> dict:
@@ -248,7 +278,8 @@ class HttpRequest(Component):
         "method": "GET, POST, PUT, PATCH or DELETE.",
         "path": "Path template, e.g. /customers/{customer_id}. Placeholders are filled from the input.",
         "params_schema": "JSON Schema (object) of the tool input, e.g. {\"type\":\"object\",\"properties\":{...}}.",
-        "auth_env": "Name of the environment variable / secret holding a bearer token. Never the token itself.",
+        "auth_env": "Name of the organisation's secret holding a bearer token, e.g. CRM_TOKEN (uppercase). "
+                    "Never the token itself.",
         "effect": "read, write_external or financial. Defaults to read for GET, write_external otherwise.",
         "description": "What the endpoint does and returns.",
         "timeout_seconds": "Request timeout (default 15).",
@@ -284,6 +315,8 @@ class HttpRequest(Component):
             problems.append("base_url must be an https URL")
         if cfg.get("method", "").upper() not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
             problems.append("method must be GET, POST, PUT, PATCH or DELETE")
+        if cfg.get("auth_env") and not _SECRET_NAME.match(cfg["auth_env"]):
+            problems.append("auth_env must be an uppercase secret name like CRM_TOKEN")
         if cfg.get("params_schema"):
             try:
                 json.loads(cfg["params_schema"])
@@ -291,7 +324,7 @@ class HttpRequest(Component):
                 problems.append("params_schema is not valid JSON")
         return problems
 
-    def build_request(self, args: dict, cfg: dict) -> urllib.request.Request:
+    def build_request(self, args: dict, cfg: dict, customer_id: int | None = None) -> urllib.request.Request:
         method = cfg["method"].upper()
         args = dict(args)
 
@@ -308,9 +341,10 @@ class HttpRequest(Component):
             raise ToolFailure("request would leave the configured host")
         headers = {"Accept": "application/json", "User-Agent": "agentgen"}
         if cfg.get("auth_env"):
-            token = os.environ.get(cfg["auth_env"])
+            token = org_secret(customer_id, cfg["auth_env"]) if customer_id is not None else None
             if not token:
-                raise ToolFailure(f"credentials not configured (secret {cfg['auth_env']} is not set)")
+                raise ToolFailure(f"credentials not configured (secret {cfg['auth_env']} is not set for this "
+                                  "organisation)")
             headers["Authorization"] = f"Bearer {token}"
         data = None
         if method == "GET":
@@ -323,9 +357,11 @@ class HttpRequest(Component):
 
     def run(self, args, ctx):
         if ctx.sandbox:
-            raise ToolFailure("no test fixture for this external API; tests never call real systems")
+            raise ToolFailure("sandbox: this external API was not called (no simulated response is configured); "
+                              "sandbox runs and tests never call real systems")
         cfg = ctx.config
-        request = self.build_request(args, cfg)
+        request = self.build_request(args, cfg, ctx.customer_id)
+        _check_public_host(urllib.parse.urlparse(request.full_url).hostname or "")
         timeout = float(cfg.get("timeout_seconds", "15"))
         retries = 2 if request.get_method() == "GET" else 0  # only retry idempotent reads
         for attempt in range(retries + 1):

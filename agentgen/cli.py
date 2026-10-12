@@ -17,6 +17,9 @@ Review, test, release:
   agentgen approve AGENT --version 2 --by "Karin Andersson"
   agentgen deploy AGENT [--version N]           # older passed version = rollback
 
+Web application:
+  agentgen serve [--port 8000]                  # then open http://127.0.0.1:8000
+
 Operate:
   agentgen chat AGENT                           # interactive; approvals asked in the terminal
   agentgen trigger AGENT new_request --payload '{"text": "..."}'
@@ -332,6 +335,17 @@ def cmd_monitor(args):
         print(f"  stop reasons: {m['stop_reasons']}")
 
 
+def cmd_serve(args):
+    import uvicorn
+
+    from .web.app import create_app
+
+    app = create_app(args.db, start_worker=not args.no_worker, worker_poll_seconds=args.poll)
+    if not args.quiet:
+        _err(f"agentgen web app on http://{args.host}:{args.port}  (database: {args.db})")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+
 def cmd_list(args):
     for row in _store(args).list_agents():
         deployed = f"v{row['deployed_version']}" if row["deployed_version"] else "not deployed"
@@ -461,6 +475,14 @@ def main(argv=None):
     p.add_argument("agent")
     p.add_argument("--days", type=int, default=30)
     p.set_defaults(func=cmd_monitor)
+
+    p = sub.add_parser("serve", help="Run the web application")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--no-worker", action="store_true", help="Don't run deployed agents' schedules and events")
+    p.add_argument("--poll", type=int, default=15, help="Worker poll interval in seconds")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_serve)
 
     sub.add_parser("list", help="List agents").set_defaults(func=cmd_list)
     sub.add_parser("components", help="List the capability library").set_defaults(

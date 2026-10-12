@@ -53,7 +53,10 @@ def fire_event(store: Store, agent_name: str, event: str, payload: str) -> list[
     return jobs
 
 
-def run_due_jobs(client, store: Store, now: datetime | None = None, approver=queue_all) -> list[dict]:
+def run_due_jobs(client, store: Store, now: datetime | None = None, approver=queue_all,
+                 client_for=None) -> list[dict]:
+    """Run due jobs. `client_for(customer_id)` (optional) gives each organisation its own
+    metered client; otherwise `client` is used for every job."""
     outcomes = []
     for job in store.due_jobs(now):
         agent = store.agent_by_id(job["agent_id"])
@@ -65,7 +68,8 @@ def run_due_jobs(client, store: Store, now: datetime | None = None, approver=que
         store.update_job(job["id"], status="running", attempts=attempts)
         spec, version = store.load_spec(agent["name"], agent["deployed_version"])
         try:
-            runtime = AgentRuntime(client, store, agent["id"], spec, version, approver=approver,
+            job_client = client_for(agent["customer_id"]) if client_for else client
+            runtime = AgentRuntime(job_client, store, agent["id"], spec, version, approver=approver,
                                    trigger_source=job["source"])
             result = runtime.run(job["input"])
             store.update_job(job["id"], status="done", run_id=result.run_id)
@@ -84,12 +88,14 @@ def run_due_jobs(client, store: Store, now: datetime | None = None, approver=que
     return outcomes
 
 
-def work(client, store: Store, once: bool = False, poll_seconds: int = 30, log=print) -> None:
+def work(client, store: Store, once: bool = False, poll_seconds: int = 30, log=print, client_for=None,
+         stop=None) -> None:
     while True:
         schedule_due(store)
-        for outcome in run_due_jobs(client, store):
+        for outcome in run_due_jobs(client, store, client_for=client_for):
             log(outcome)
         store.purge_expired_memory()
-        if once:
+        if once or (stop is not None and stop.wait(poll_seconds)):
             return
-        time.sleep(poll_seconds)
+        if stop is None:
+            time.sleep(poll_seconds)

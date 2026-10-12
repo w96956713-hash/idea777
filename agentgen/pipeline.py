@@ -145,6 +145,22 @@ confirmed with the customer, including missing integrations."""
 
 # ---------------------------------------------------------------- stages
 
+INTAKE_FIELDS = [
+    ("company", "Company"),
+    ("industry", "Industry"),
+    ("problem", "Problem to solve"),
+    ("workflow", "Current workflow"),
+    ("outcome", "Desired outcome"),
+    ("systems", "Existing software and data sources"),
+    ("constraints", "Operational and security constraints"),
+]
+
+
+def compose_intake(fields: dict) -> str:
+    """The structured intake form as one description for the models."""
+    return "\n\n".join(f"{label}:\n{fields[key].strip()}" for key, label in INTAKE_FIELDS
+                         if str(fields.get(key, "")).strip())
+
 
 def _qa(project) -> list[dict]:
     return json.loads(project["answers_json"]) if project["answers_json"] else []
@@ -152,7 +168,7 @@ def _qa(project) -> list[dict]:
 
 def generate_questions(client, store: Store, project_id: int) -> Discovery:
     project = store.project(project_id)
-    discovery = structured(client, Discovery, DISCOVERY_SYSTEM, f"Company description:\n\n{project['intake']}")
+    discovery = structured(client, Discovery, DISCOVERY_SYSTEM, _context(store, project))
     store.update_project(project_id, questions_json=discovery.model_dump_json(), stage="discovery")
     return discovery
 
@@ -163,27 +179,46 @@ def record_answers(store: Store, project_id: int, answers: list[dict]) -> None:
     store.update_project(project_id, answers_json=json.dumps(cleaned, ensure_ascii=False))
 
 
-def _context(project) -> str:
-    parts = [f"Company description:\n{project['intake']}"]
+def _available_data(store: Store, customer_id: int) -> str:
+    lines = []
+    for ds in store.datasets(customer_id):
+        lines.append(f"- dataset `{ds['name']}` ({ds['row_count']} rows): {', '.join(json.loads(ds['columns_json']))}")
+    for doc in store.documents(customer_id):
+        lines.append(f"- document \"{doc['title']}\" ({doc['size']} characters)")
+    if not lines:
+        return "No datasets or documents have been uploaded to the platform yet."
+    return ("Already uploaded to the platform by this company (use these exact dataset names in query_data "
+            "config; documents are searchable with knowledge_search):\n" + "\n".join(lines))
+
+
+def _context(store: Store, project) -> str:
+    parts = [f"Company description:\n{project['intake']}", _available_data(store, project["customer_id"])]
     qa = [a for a in _qa(project) if a["answer"]]
     if qa:
         parts.append("Discovery answers:\n" + "\n".join(f"Q: {a['question']}\nA: {a['answer']}" for a in qa))
-    unanswered = [a["question"] for a in _qa(project) if not a["answer"]]
+    answered = {a["question"] for a in _qa(project) if a["answer"]}
+    asked = [q["question"] for q in json.loads(project["questions_json"])["questions"]] if project["questions_json"] else []
+    unanswered = [q for q in asked if q not in answered] + [
+        a["question"] for a in _qa(project) if not a["answer"] and a["question"] not in asked]
     if unanswered:
         parts.append("Unanswered questions (treat as unknown):\n" + "\n".join(f"- {q}" for q in unanswered))
+    if project["amendments"]:
+        parts.append("Corrections and decisions from the customer's review (these override anything above):\n"
+                     + project["amendments"])
     return "\n\n".join(parts)
 
 
 def analyze(client, store: Store, project_id: int) -> Analysis:
     project = store.project(project_id)
-    analysis = structured(client, Analysis, ANALYSIS_SYSTEM.format(catalog=catalog_description()), _context(project))
+    analysis = structured(client, Analysis, ANALYSIS_SYSTEM.format(catalog=catalog_description()),
+                          _context(store, project))
     store.update_project(project_id, analysis_json=analysis.model_dump_json(), stage="analysed")
     return analysis
 
 
 def design(client, store: Store, project_id: int) -> tuple[AgentSpec, int]:
     project = store.project(project_id)
-    prompt = _context(project)
+    prompt = _context(store, project)
     if project["analysis_json"]:
         prompt += "\n\nAnalysis (design the recommended agent):\n" + project["analysis_json"]
     design_out = structured(client, AgentDesign, DESIGN_SYSTEM.format(catalog=catalog_description()), prompt)

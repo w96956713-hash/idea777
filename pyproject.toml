@@ -3,10 +3,10 @@ name = "agentgen"
 version = "0.1.0"
 description = "Turns business requirements into tested, versioned AI agents."
 requires-python = ">=3.10"
-dependencies = ["anthropic>=1.13", "pydantic>=2", "pyyaml>=6"]
+dependencies = ["anthropic>=1.13", "pydantic>=2", "pyyaml>=6", "fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "httpx2"]
 
 [project.scripts]
 agentgen = "agentgen.cli:main"
@@ -16,4 +16,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["agentgen"]
+packages = ["agentgen", "agentgen.web"]
+
+[tool.setuptools.package-data]
+"agentgen.web" = ["static/*"]
