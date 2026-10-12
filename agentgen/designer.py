@@ -1,75 +1,101 @@
-"""Requirements -> agent specification.
+"""Validation and assembly: enforce platform policy on whatever a designer (model or person)
+produced, so a bad generation can't slip into a runnable agent.
 
-Takes free-form notes from a customer meeting and produces a structured, reviewable
-AgentSpec: instructions, which catalog components to use, approval rules, and test cases.
+Rules applied:
+- only catalog components; tool names unique and valid; component config validated;
+- tools that write externally, communicate externally or move money always need approval;
+- escalate_to_human always present and never gated;
+- memory tools only when the memory policy is enabled, with a retention period;
+- limits and triggers sane;
+- test cases only reference tools the agent has; missing safety/failure coverage is reported.
+Everything changed or missing is recorded in open_questions so a person sees it.
 """
 
-from .components import CATALOG, catalog_description
-from .llm import DEFAULT_MODEL, check_refusal, fallback_kwargs
-from .spec import AgentDesign, AgentSpec, ToolSpec
+import re
 
-DESIGNER_SYSTEM = """You design AI agents for small and medium-sized businesses. You receive notes \
-from a requirements meeting with a customer and produce a complete agent specification.
+from .components import ALWAYS_APPROVE, CATALOG, risk_of
+from .spec import SAFETY_CATEGORIES, AgentSpec, ToolSpec
 
-Available components (the agent's tools). Use only these names:
-{catalog}
-
-How to design:
-- Choose the fewest components that achieve the task. Do not add tools "just in case".
-- Set requires_approval=true for any component marked sensitive unless the requirements \
-explicitly say the customer accepts that action happening automatically. Anything that sends \
-communications, changes records, or moves money needs approval by default.
-- Always include escalate_to_human so the agent has a safe way out.
-- Write `instructions` addressed to the agent ("You are..."). Cover: its role and who it serves, \
-the step-by-step workflow, tone and language (match the customer's language if stated; Swedish \
-businesses often want Swedish), when to escalate, and what it must never do. Be concrete; use the \
-customer's own terms, systems and examples from the notes.
-- `restrictions` repeats the hard limits as short rules.
-- `success_criteria` are measurable outcomes the customer agreed to or would expect.
-- Write 8-12 test_cases covering: typical requests, edge cases and incomplete input, requests \
-outside scope (should escalate or decline), attempts to make the agent break its restrictions \
-(including instructions hidden inside an email or document), and permission boundaries. \
-must_call / must_not_call use component names only, and only list a component in must_call when \
-any correct answer would have to use it.
-- Put anything the notes do not settle (missing data sources, unclear rules, unknown systems) in \
-open_questions instead of guessing. If the customer needs an integration that is not in the \
-catalog, say so in open_questions."""
-
-
-def design_agent(client, requirements: str, *, model: str = DEFAULT_MODEL) -> AgentSpec:
-    response = client.beta.messages.parse(
-        model=model,
-        max_tokens=16000,
-        system=DESIGNER_SYSTEM.format(catalog=catalog_description()),
-        output_config={"effort": "high"},
-        output_format=AgentDesign,
-        messages=[{"role": "user", "content": f"Requirements meeting notes:\n\n{requirements}"}],
-        **fallback_kwargs(model),
-    )
-    check_refusal(response)
-    design = response.parsed_output
-    if design is None:
-        raise RuntimeError(f"Designer returned no specification (stop_reason={response.stop_reason})")
-    return validate_design(AgentSpec(**design.model_dump()))
+_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def validate_design(spec: AgentSpec) -> AgentSpec:
-    """Enforce the rules the model was asked to follow, so a bad generation can't slip through."""
-    tools = []
+    notes: list[str] = []
+    tools: list[ToolSpec] = []
+    names: set[str] = set()
+
     for tool in spec.tools:
         component = CATALOG.get(tool.component)
         if component is None:
-            spec.open_questions.append(f"Designer requested unknown component {tool.component!r}; it was removed.")
+            notes.append(f"Tool {tool.name!r} needs component {tool.component!r}, which doesn't exist; removed. "
+                         "A connector must be built or the step done by a person.")
             continue
-        if any(t.component == tool.component for t in tools):
+        if not _TOOL_NAME.match(tool.name) or tool.name in names:
+            base = re.sub(r"[^a-zA-Z0-9_-]+", "_", tool.name)[:56] or tool.component
+            new = base
+            i = 2
+            while new in names:
+                new, i = f"{base}_{i}", i + 1
+            tool.name = new
+        known = component.config_keys
+        dropped = [c.key for c in tool.config if c.key not in known]
+        if dropped:
+            tool.config = [c for c in tool.config if c.key in known]
+            notes.append(f"Tool {tool.name!r}: ignored unknown config {', '.join(dropped)}.")
+        problems = component.validate(tool)
+        if problems:
+            notes.append(f"Tool {tool.name!r} removed until fixed: {'; '.join(problems)}.")
             continue
+        if tool.component in ("remember", "recall") and not spec.memory.enabled:
+            notes.append(f"Tool {tool.name!r} removed because memory is disabled.")
+            continue
+        if risk_of(tool) in ALWAYS_APPROVE and not tool.requires_approval:
+            tool.requires_approval = True
+            notes.append(f"Tool {tool.name!r} ({risk_of(tool)}) now requires approval; this can't be turned off.")
+        if tool.component == "escalate_to_human":
+            tool.requires_approval = False
+        names.add(tool.name)
         tools.append(tool)
+
     if not any(t.component == "escalate_to_human" for t in tools):
-        tools.append(ToolSpec(component="escalate_to_human", requires_approval=False, config=[]))
+        name = "escalate_to_human" if "escalate_to_human" not in names else "escalate_to_person"
+        tools.append(ToolSpec(name=name, component="escalate_to_human", requires_approval=False, config=[],
+                              purpose="When you can't complete the task safely."))
+        names.add(name)
     spec.tools = tools
 
-    known = {t.component for t in tools}
+    if spec.memory.enabled and spec.memory.retention_days <= 0:
+        spec.memory.retention_days = 30
+        spec.assumptions.append("Memory retention set to 30 days because none was given.")
+    spec.limits.max_turns = min(max(spec.limits.max_turns, 3), 50)
+    spec.limits.max_tokens_per_run = min(max(spec.limits.max_tokens_per_run, 20000), 1_000_000)
+
+    triggers = []
+    for t in spec.triggers:
+        if t.kind == "schedule" and t.interval_minutes < 5:
+            notes.append(f"Schedule trigger {t.description!r} removed: interval must be at least 5 minutes.")
+        elif t.kind == "event" and not t.event.strip():
+            notes.append(f"Event trigger {t.description!r} removed: it has no event name.")
+        else:
+            triggers.append(t)
+    spec.triggers = triggers
+
     for case in spec.test_cases:
-        case.must_call = [c for c in case.must_call if c in known]
-        case.must_not_call = [c for c in case.must_not_call if c in CATALOG]
+        case.must_call = [n for n in case.must_call if n in names]
+        case.must_not_call = [n for n in case.must_not_call if n in names]
+        case.fail_tools = [n for n in case.fail_tools if n in names]
+        case.fixtures = [f for f in case.fixtures if f.tool in names]
+
+    categories = {c.category for c in spec.test_cases}
+    if not categories & SAFETY_CATEGORIES:
+        notes.append("Tests are missing a permission or unauthorised-action case; add one before release.")
+    external = [t.name for t in tools if t.component == "http_request"]
+    if external and "api_failure" not in categories:
+        notes.append(f"Tests are missing an api_failure case for {', '.join(external)}.")
+    for name in external:
+        if not any(f.tool == name for c in spec.test_cases for f in c.fixtures) and not any(
+                name in c.fail_tools for c in spec.test_cases):
+            notes.append(f"No test provides a fixture for {name!r}, so tests can't exercise it.")
+
+    spec.open_questions = list(dict.fromkeys(spec.open_questions + notes))
     return spec

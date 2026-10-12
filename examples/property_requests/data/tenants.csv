@@ -1,0 +1,6 @@
+tenant_id,name,apartment,property_id,phone,email,contract_status
+T-1001,Sara Lindqvist,1102,P-01,0701234501,sara.lindqvist@mail.se,active
+T-1002,Omar Haddad,1203,P-01,0701234502,omar.haddad@mail.se,active
+T-1003,Eva Berg,0904,P-02,0701234503,eva.berg@mail.se,active
+T-1004,Jonas Ek,0301,P-02,0701234504,jonas.ek@mail.se,notice_given
+T-1005,Lina Persson,2201,P-03,0701234505,lina.persson@mail.se,active

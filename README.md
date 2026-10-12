@@ -1,73 +1,112 @@
-# agentgen — AI agent generator
+# agentgen: bespoke AI agents from business requirements
 
-Turns a customer's requirements into a tested, versioned AI agent, and stores
-everything (customers, requirements, agent versions, test results, runs and an audit
-log) in a database.
+A company explains what it needs. agentgen works out what is worth automating, designs a
+specialised agent, assembles it from tested capabilities, tests it against realistic and
+adversarial scenarios, and, after a person approves it, deploys and monitors it.
+
+Agents are **data, not code**: each agent is a versioned spec executed by one generic
+runtime with a shared capability library. Sales, service, research, BI, operations, document,
+finance and email agents are different combinations of the same components, not separate
+implementations.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the audit, architecture and roadmap.
 
 ```
-meeting notes ──► design ──► spec (draft) ──► human review ──► test ──► deploy ──► run
-                   (Claude)   stored in DB      export/import    sandbox   only if      approvals,
-                                                                 + judge   tests pass   audit log
+intake ─► discovery questions ─► analysis ─► design ─► validate ─► test ─► approve ─► deploy ─► operate ─► monitor
+                                  (what to     (spec)    (policy)   (sandbox,  (named     (pass     (triggers,  (cost,
+                                  automate,                          failures,  person)    gate)     jobs,       errors,
+                                  integrations,                      regression)                     approvals)  escalations)
+                                  cost)
 ```
 
-## How it works
+## What an agent can be built from
 
-| Step | What happens | Code |
+| Capability | Component(s) | Risk class |
 |---|---|---|
-| 1. Requirements | Meeting notes are saved against the customer. | `store.py` |
-| 2. Design | Claude reads the notes and writes a structured **spec**: instructions, which tools to use, which actions need human approval, 8–12 test cases, and open questions. | `designer.py`, `spec.py` |
-| 3. Assemble | The agent is built only from **reviewed components** (knowledge search, email draft/send, create record, escalate to human). Generated agents never contain generated code. | `components.py` |
-| 4. Test | Each test case runs in a **sandbox copy** of the agent's data. A case passes only if the right tools were used *and* a grader model agrees the behaviour matches. | `evaluate.py` |
-| 5. Deploy | Only versions that passed can be deployed. Deploying an older passed version is a rollback. | `store.py` |
-| 6. Run | Sensitive actions stop for human approval. Every step, tool call and token count is written to the database. | `runtime.py` |
+| Company documents | `knowledge_search`, `read_document` | read |
+| Company data (SQL, read-only, allowlisted tables) | `query_data` over imported datasets | read |
+| Business records (cases, leads, flags…) | `search_records`, `create_record`, `update_record` | read / write_internal |
+| Any REST API (CRM, ERP, ticketing, contractors…) | `http_request`: one configured endpoint = one tool | read / write_external / financial |
+| Communication | `draft_message`, `send_message` (email, Slack, Teams, SMS, webhook) | write_internal / external_comm |
+| Memory with retention | `remember`, `recall` | write_internal / read |
+| Planning and follow-up | `schedule_task` | write_internal |
+| Exact arithmetic | `calculate` | read |
+| Hand-off | `escalate_to_human` (always present) | write_internal |
+
+Policy is enforced by the platform, not left to the model: external writes, external
+communication and money always need a person's approval; agents only see their own tools and
+data; each run has turn and token budgets; every step is audited.
 
 ## Quick start
 
 ```bash
 pip install -e '.[dev]'
-export ANTHROPIC_API_KEY=...        # from console.anthropic.com
-
-# Try the example (an accounting firm's email inbox)
-agentgen import examples/accounting_firm/spec.yaml --customer "Andersson Redovisning AB"
-agentgen knowledge client-email-triage examples/accounting_firm/knowledge/*.md
-agentgen test client-email-triage -v
-agentgen deploy client-email-triage
-agentgen chat client-email-triage
-
-# Or generate a new agent from your own meeting notes
-agentgen design examples/accounting_firm/requirements.md --customer "Andersson Redovisning AB"
-agentgen export client-email-triage -o review.yaml   # read it, fix it
-agentgen import review.yaml --customer "Andersson Redovisning AB"  # saved as next version
+pytest                                   # offline tests, no API key needed
+export ANTHROPIC_API_KEY=...
 ```
 
-Other commands: `agentgen list`, `agentgen components`, `agentgen usage <agent>`.
-Run the offline tests with `pytest` (no API key needed).
+**From requirements (the main flow):**
 
-## The database
+```bash
+agentgen project new examples/property_requests/intake.md --customer "Hemvist Fastigheter AB" --title "Tenant requests"
+agentgen project answer 1        # answer the discovery questions
+agentgen project analyze 1       # opportunities, what stays human, integrations, risks, cost estimate
+agentgen project design 1        # agent spec v1, validated against platform policy
+```
 
-SQLite by default (`agentgen.db`, or set `AGENTGEN_DB`). Tables:
+**Or load a finished example and run it:**
 
-- `customers`, `requirements`: who the work is for and what they asked for
-- `agents`, `agent_versions`: every spec version, its status (draft/passed/failed) and which version is live
-- `test_runs`: full test reports per version
-- `knowledge_docs`: each agent's company documents
-- `runs`, `audit_log`: every conversation, tool call, approval decision and token count
-- `records`, `outbox`, `escalations`: what the agents produced (cases, emails, hand-offs)
+```bash
+# Operations: route tenant requests using company data and a contractor API
+agentgen data import "Hemvist Fastigheter AB" tenants examples/property_requests/data/tenants.csv
+agentgen data import "Hemvist Fastigheter AB" properties examples/property_requests/data/properties.csv
+agentgen import examples/property_requests/spec.yaml --customer "Hemvist Fastigheter AB"
+agentgen knowledge service-request-router examples/property_requests/knowledge/routing_policy.md
+agentgen tools service-request-router    # tools, risk classes, approval policy
+agentgen test service-request-router     # sandbox, fixtures, simulated outages, grader
+agentgen approve service-request-router --by "Your Name"
+agentgen deploy service-request-router
+agentgen trigger service-request-router new_request --payload "Omar Haddad, 1203: no heating" --run-now
+agentgen actions list                    # approvals waiting from unattended runs
+agentgen monitor service-request-router
 
-Every customer-owned row is keyed by agent (and through it, customer), and the runtime only
-ever reads and writes rows for the agent it is running.
+# Business intelligence: answers questions and drafts a weekly report on a schedule
+agentgen data import "Nordhem Design" orders examples/sales_insights/data/orders.csv
+agentgen data import "Nordhem Design" products examples/sales_insights/data/products.csv
+agentgen import examples/sales_insights/spec.yaml --customer "Nordhem Design"
+agentgen test weekly-sales-insights && agentgen deploy weekly-sales-insights
+agentgen worker --once                   # runs due schedules, events and follow-ups
+```
 
-The SQL is portable. To move to hosted PostgreSQL for production, replace `connect()` in
-`store.py` (and the `?` placeholders become `%s` with psycopg).
+`examples/accounting_firm` is a version-1 email agent, kept to show that older specs are upgraded
+automatically.
 
-## Adding an integration
+## Testing and release
 
-Add one `Component` subclass to `components.py` (name, description, input schema, `run`).
-The designer sees it in the catalog automatically. Next likely components: Microsoft 365 mail
-(read inbox, deliver approved `outbox` rows), Fortnox, Visma.
+- Test cases have categories: task, quality, tool_use, missing_info, permission,
+  unauthorized_action, api_failure, edge_case.
+- Tests run on a sandbox copy of the agent's data. External APIs are never called: `fixtures`
+  supply responses, `fail_tools` simulates outages.
+- A case passes when required tools were used, forbidden tools weren't attempted, the run ended
+  normally, and a grader model agrees with the expected behaviour.
+- A version passes when ≥90% of cases pass, **every** safety case passes, and nothing that passed in
+  the last passed version now fails (its cases are carried forward automatically).
+- Agents that can change records, act on external systems, communicate externally or move money also
+  need a recorded approval (`agentgen approve`) before `deploy`. Rollback = deploy an older passed version.
 
-## Models
+## What is not built yet
 
-The designer, the agents and the test judge use `claude-opus-5-5` with server-side refusal
-fallback enabled. Each agent's model and effort level live in its spec, so a cheaper model can be
-set per agent once tests show the quality holds.
+These are stated honestly so nothing is mistaken for a working feature:
+
+- **Message delivery.** `send_message` queues messages in the outbox (`pending_delivery`); channel
+  connectors (Microsoft Graph, Slack, SMS) are not built.
+- **Inbound connectors.** Webhooks/inbox listeners that turn real emails or portal submissions into
+  events (`agentgen trigger` is the entry point they will call).
+- **Web dashboard and HTTP API.** The CLI is the interface today. The earlier browser demo predates
+  this architecture and is email-centric; don't use it to judge the product.
+- **Platform user roles**, Postgres with row-level security, a secret manager, OAuth, and semantic
+  document search. Planned for stage 2 (see the architecture doc).
+- **Data residency.** It depends on where you deploy and which model provider agreement applies; no
+  guarantee is implied by this code.
+- **Real-API verification.** The offline tests use a scripted model. Run `agentgen test` with an API
+  key to measure real behaviour.
