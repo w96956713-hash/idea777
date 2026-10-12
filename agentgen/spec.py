@@ -93,6 +93,9 @@ class TestCase(BaseModel):
     must_not_call: list[str] = Field(description="Tool names the agent must not use.")
     fail_tools: list[str] = Field(description="Tool names that fail in this test (simulated outage).")
     fixtures: list[Fixture] = Field(description="Responses for tools that would reach external systems.")
+    must_include: list[str] = Field(description="Exact text the final answer must contain, e.g. a correct total "
+                                                "like '20651'. Checked deterministically; leave empty if wording varies.")
+    must_not_include: list[str] = Field(description="Text the final answer must never contain, e.g. leaked data.")
 
 
 class AgentDesign(BaseModel):
@@ -161,6 +164,8 @@ def upgrade_spec_dict(data: dict) -> dict:
         c.setdefault("category", "task")
         c.setdefault("fail_tools", [])
         c.setdefault("fixtures", [])
+        c.setdefault("must_include", [])
+        c.setdefault("must_not_include", [])
         c["must_call"] = [renamed.get(n, n) for n in c.get("must_call", [])]
         c["must_not_call"] = [renamed.get(n, n) for n in c.get("must_not_call", [])]
         cases.append(c)

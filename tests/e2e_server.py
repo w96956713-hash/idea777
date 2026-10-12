@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import uvicorn  # noqa: E402
 
 from agentgen.web.app import create_app  # noqa: E402
-from fake_model import ScriptedModel  # noqa: E402
+from fake_model import ScriptedProvider  # noqa: E402
 
-model = ScriptedModel()
-app = create_app(sys.argv[1], client_factory=lambda: model, worker_poll_seconds=2)
+model = ScriptedProvider()
+app = create_app(sys.argv[1], provider_factory=lambda: model, worker_poll_seconds=2)
 uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[2]), log_level="warning")

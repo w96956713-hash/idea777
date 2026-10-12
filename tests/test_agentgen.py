@@ -2,8 +2,6 @@
 
 import io
 import json
-import urllib.request
-from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +16,7 @@ from agentgen.evaluate import Verdict, check_tools, evaluate
 from agentgen.monitor import agent_metrics
 from agentgen.pipeline import Analysis, Discovery, analyze, design, generate_questions, record_answers
 from agentgen.runtime import AgentRuntime, approve_all, execute_queued_action, queue_all
+from agentgen.providers import ModelProvider, Structured, ToolUse, Turn, Usage
 from agentgen.spec import AgentDesign, AgentSpec, ConfigItem, ToolSpec
 from agentgen.spec import TestCase as Case
 from agentgen.store import Store, utcnow
@@ -43,31 +42,35 @@ def response(*blocks, stop="end_turn", tokens=(10, 5)):
                            usage=SimpleNamespace(input_tokens=tokens[0], output_tokens=tokens[1]))
 
 
-class FakeClient:
-    """create() returns scripted agent responses; stream() returns structured outputs by type."""
+class FakeClient(ModelProvider):
+    """Test double provider: turn() returns scripted agent responses; structured() returns
+    configured outputs by type (and verdicts for the grader). Labelled simulated."""
+
+    name = "fake"
+    simulated = True
 
     def __init__(self, responses=(), structured=None, verdict=True):
         self.responses = list(responses)
-        self.structured = dict(structured or {})
+        self.structured_outputs = dict(structured or {})
         self.verdict = verdict
         self.requests = []
-        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create, stream=self._stream))
 
-    def _create(self, **kwargs):
-        self.requests.append({**kwargs, "messages": list(kwargs["messages"])})
+    def turn(self, *, model, system, tools, messages, effort="medium", max_tokens=16000):
+        self.requests.append({"model": model, "system": system, "tools": tools, "messages": list(messages)})
         item = self.responses.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        uses = [ToolUse(b.id, b.name, b.input) for b in item.content if b.type == "tool_use"]
+        text = "\n".join(b.text for b in item.content if b.type == "text")
+        return Turn(stop_reason=item.stop_reason, text=text, tool_uses=uses, content=item.content,
+                    usage=Usage(item.usage.input_tokens, item.usage.output_tokens), model=model)
 
-    @contextmanager
-    def _stream(self, **kwargs):
-        fmt = kwargs["output_format"]
-        if fmt is Verdict:
+    def structured(self, output_type, *, system, prompt, model, effort="high", max_tokens=32000):
+        if output_type is Verdict:
             parsed = Verdict(reasoning="ok", passed=self.verdict)
         else:
-            parsed = self.structured[fmt]
-        yield SimpleNamespace(get_final_message=lambda: SimpleNamespace(stop_reason="end_turn", parsed_output=parsed))
+            parsed = self.structured_outputs[output_type]
+        return Structured(value=parsed, usage=Usage(100, 10), model=model)
 
 
 # ---------------------------------------------------------------- fixtures
@@ -135,7 +138,7 @@ def test_validation_enforces_policy():
         ],
         success_criteria=[], restrictions=[], assumptions=[], open_questions=[],
         test_cases=[Case(name="c", category="task", input="i", expected_behavior="e", must_call=["teleport", "pay"],
-                         must_not_call=[], fail_tools=[], fixtures=[])],
+                         must_not_call=[], fail_tools=[], fixtures=[], must_include=[], must_not_include=[])],
     ).model_dump()))
     names = [t.name for t in spec.tools]
     assert names == ["pay", "escalate_to_human"]
@@ -223,7 +226,7 @@ def test_http_request(router, monkeypatch):
         sent.update(url=request.full_url, auth=request.get_header("Authorization"), body=json.loads(request.data))
         return Resp(b'{"work_order_id": "WO-1"}')
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(components, "http_open", fake_urlopen)
     out = http.run({"address": "Kopparbergsvägen 12", "apartment": "1102", "problem": "leak", "priority": "urgent",
                     "case_id": "7"}, ctx_for(router, tool))
     assert out.startswith("HTTP 201") and "WO-1" in out
@@ -359,7 +362,7 @@ def _passing_responses(n):
 
 def test_check_tools():
     case = Case(name="c", category="task", input="i", expected_behavior="e", must_call=["a"], must_not_call=["b"],
-                fail_tools=[], fixtures=[])
+                fail_tools=[], fixtures=[], must_include=[], must_not_include=[])
     assert check_tools(case, {"a"}, {"a"}) == ""
     assert "did not use a" in check_tools(case, set(), set())
     assert "attempted forbidden b" in check_tools(case, {"a"}, {"a", "b"})
@@ -473,7 +476,8 @@ def test_pipeline_stages_are_persisted(store):
     project = store.create_project(customer, "Requests", (PROPERTY / "intake.md").read_text())
     designed = load(PROPERTY / "spec.yaml")
     client = FakeClient(structured={
-        Discovery: Discovery(questions=[{"topic": "volumes", "question": "How many urgent cases per week?", "why": "sizing"}]),
+        Discovery: Discovery(missing_information=["Weekly volume of urgent cases"], contradictions=[],
+                             questions=[{"topic": "volumes", "question": "How many urgent cases per week?", "why": "sizing"}]),
         Analysis: Analysis(process_summary="p", opportunities=[], recommended_agent="router",
                            recommended_capabilities=[], keep_human=["rent disputes"], integrations=[], data_needed=[],
                            risks=[], complexity="medium", complexity_reasons=[], estimated_runs_per_month=2600,
@@ -520,3 +524,58 @@ def test_cli_flow(tmp_path, capsys):
     assert AgentSpec.from_yaml(exported.read_text()).tool("dispatch_contractor").requires_approval
     main(["--db", db, "list"])
     assert "client-email-triage" in capsys.readouterr().out
+
+
+def test_http_redirects_are_not_followed(router, monkeypatch):
+    """A redirect would skip the internal-address check and hand the credentials to another host."""
+    import http.server
+    import threading
+
+    hits = []
+
+    class Redirect(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits.append((self.path, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        spec, _ = router.load_spec("service-request-router")
+        tool = spec.tool("dispatch_contractor").model_copy(deep=True)
+        for item in tool.config:
+            if item.key == "base_url":
+                item.value = f"http://127.0.0.1:{server.server_port}"
+        cid = router.agent("service-request-router")["customer_id"]
+        monkeypatch.setenv(components.secret_env_name(cid, "FASTIGHETSDRIFT_TOKEN"), "secret-token")
+        checked = []
+        monkeypatch.setattr(components, "_check_public_host", checked.append)  # allow the local test server
+        with pytest.raises(ToolFailure, match="redirect.*not followed"):
+            CATALOG["http_request"].run({"address": "a", "apartment": "1", "problem": "p", "priority": "urgent",
+                                         "case_id": "1"}, ctx_for(router, tool))
+        assert checked == ["127.0.0.1"] and len(hits) == 1  # only the configured host was contacted
+    finally:
+        server.shutdown()
+
+
+def test_jobs_interrupted_by_a_restart_are_retried_once_the_worker_starts(tmp_path):
+    from agentgen.worker import MAX_ATTEMPTS, recover_interrupted_jobs
+
+    store = Store(str(tmp_path / "w.db"))
+    cid = store.get_or_create_customer("Nordhem Design")
+    store.save_version(cid, AgentSpec.from_yaml((EXAMPLES / "sales_insights" / "spec.yaml").read_text()))
+    agent_id = store.agent("weekly-sales-insights")["id"]
+    retry, last = store.enqueue_job(agent_id, "a", "event:x"), store.enqueue_job(agent_id, "b", "event:y")
+    store.update_job(retry, status="running", attempts=1)
+    store.update_job(last, status="running", attempts=MAX_ATTEMPTS)
+    assert recover_interrupted_jobs(store) == [retry, last]
+    jobs = {j["id"]: j for j in store.conn.execute("SELECT * FROM jobs")}
+    assert jobs[retry]["status"] == "pending" and "Interrupted" in jobs[retry]["error"]
+    assert jobs[last]["status"] == "failed"
+    assert store.conn.execute("SELECT COUNT(*) FROM escalations").fetchone()[0] == 1
+    assert recover_interrupted_jobs(store) == []

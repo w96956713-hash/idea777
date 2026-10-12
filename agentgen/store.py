@@ -206,6 +206,15 @@ CREATE TABLE IF NOT EXISTS model_usage (
     usd REAL NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tool_executions (
+    id INTEGER PRIMARY KEY,
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    idem_key TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    result TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (agent_id, idem_key)
+);
 CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY,
     agent_id INTEGER NOT NULL REFERENCES agents(id),
@@ -229,6 +238,17 @@ ADDED_COLUMNS = [
     ("runs", "error", "TEXT"),
     ("projects", "intake_json", "TEXT"),
     ("projects", "amendments", "TEXT"),
+    ("projects", "questions_provider", "TEXT"),
+    ("projects", "analysis_provider", "TEXT"),
+    ("projects", "design_provider", "TEXT"),
+    ("agent_versions", "origin", "TEXT NOT NULL DEFAULT 'generated'"),
+    ("agent_versions", "provider", "TEXT"),
+    ("agent_versions", "note", "TEXT"),
+    ("runs", "provider", "TEXT"),
+    ("runs", "simulated", "INTEGER NOT NULL DEFAULT 0"),
+    ("model_usage", "provider", "TEXT NOT NULL DEFAULT 'anthropic'"),
+    ("model_usage", "simulated", "INTEGER NOT NULL DEFAULT 0"),
+    ("pending_actions", "idem_key", "TEXT"),
 ]
 
 
@@ -323,7 +343,7 @@ class Store:
 
     def update_project(self, project_id: int, **fields) -> None:
         allowed = {"questions_json", "answers_json", "analysis_json", "agent_name", "stage", "intake", "intake_json",
-                   "amendments", "title"}
+                   "amendments", "title", "questions_provider", "analysis_provider", "design_provider"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"Can only update {sorted(allowed)}")
         sets = ", ".join(f"{k} = ?" for k in fields)
@@ -347,8 +367,11 @@ class Store:
                FROM agents a JOIN customers c ON c.id = a.customer_id ORDER BY a.name"""
         ).fetchall()
 
-    def save_version(self, customer_id: int, spec: AgentSpec, requirements_id: int | None = None) -> int:
-        """Store a spec as the next version of its agent (creating the agent if new)."""
+    def save_version(self, customer_id: int, spec: AgentSpec, requirements_id: int | None = None,
+                     origin: str = "generated", provider: str | None = None, note: str | None = None) -> int:
+        """Store a spec as the next version of its agent (creating the agent if new).
+        origin: generated | edited | imported | restored | fixed | tests_added; provider: which model
+        provider produced it (None for human edits)."""
         row = self.conn.execute("SELECT * FROM agents WHERE name = ?", (spec.name,)).fetchone()
         if row is not None and row["customer_id"] != customer_id:
             # Agent names are global; never reveal or reuse another organisation's agent.
@@ -368,9 +391,9 @@ class Store:
         ).fetchone()["v"]
         version = latest + 1
         self._insert(
-            """INSERT INTO agent_versions (agent_id, version, requirements_id, spec_json, status, created_at)
-               VALUES (?, ?, ?, ?, 'draft', ?)""",
-            (agent_id, version, requirements_id, spec.model_dump_json(), _now()),
+            """INSERT INTO agent_versions (agent_id, version, requirements_id, spec_json, status, created_at, origin,
+               provider, note) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?)""",
+            (agent_id, version, requirements_id, spec.model_dump_json(), _now(), origin, provider, note),
         )
         return version
 
@@ -523,10 +546,12 @@ class Store:
 
     # --- runs, audit and agent outputs ---------------------------------------------------
 
-    def start_run(self, agent_id: int, version: int, input_text: str, trigger_source: str = "manual") -> int:
+    def start_run(self, agent_id: int, version: int, input_text: str, trigger_source: str = "manual",
+                  provider: str | None = None, simulated: bool = False) -> int:
         return self._insert(
-            "INSERT INTO runs (agent_id, version, input, trigger_source, created_at) VALUES (?, ?, ?, ?, ?)",
-            (agent_id, version, input_text, trigger_source, _now()),
+            """INSERT INTO runs (agent_id, version, input, trigger_source, provider, simulated, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (agent_id, version, input_text, trigger_source, provider, int(simulated), _now()),
         )
 
     def finish_run(self, run_id: int, output: str, stop_reason: str, input_tokens: int, output_tokens: int,
@@ -640,12 +665,43 @@ class Store:
         sets = ", ".join(f"{k} = ?" for k in fields)
         self._update(f"UPDATE jobs SET {sets} WHERE id = ?", (*fields.values(), job_id))
 
-    def queue_action(self, agent_id: int, run_id: int | None, tool: str, tool_input: dict) -> int:
+    def queue_action(self, agent_id: int, run_id: int | None, tool: str, tool_input: dict,
+                     idem_key: str | None = None) -> int:
+        """Queue an action for a person. With an idempotency key, the same action requested again
+        (e.g. by a retried job) returns the existing entry instead of queuing a duplicate."""
+        if idem_key:
+            row = self.conn.execute("SELECT id FROM pending_actions WHERE agent_id = ? AND idem_key = ?",
+                                    (agent_id, idem_key)).fetchone()
+            if row:
+                return row["id"]
         return self._insert(
-            """INSERT INTO pending_actions (agent_id, run_id, tool, input_json, status, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
-            (agent_id, run_id, tool, json.dumps(tool_input, ensure_ascii=False), _now()),
+            """INSERT INTO pending_actions (agent_id, run_id, tool, input_json, status, idem_key, created_at)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+            (agent_id, run_id, tool, json.dumps(tool_input, ensure_ascii=False), idem_key, _now()),
         )
+
+    def action_by_key(self, agent_id: int, idem_key: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM pending_actions WHERE agent_id = ? AND idem_key = ?",
+                                 (agent_id, idem_key)).fetchone()
+
+    def claim_action(self, action_id: int, decided_by: str) -> bool:
+        """Atomically move a pending action to 'executing'. Only one caller can win, so two people
+        approving at the same moment can't run it twice."""
+        cur = self.conn.execute(
+            "UPDATE pending_actions SET status = 'executing', decided_by = ? WHERE id = ? AND status = 'pending'",
+            (decided_by, action_id))
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def executed_result(self, agent_id: int, idem_key: str) -> str | None:
+        row = self.conn.execute("SELECT result FROM tool_executions WHERE agent_id = ? AND idem_key = ?",
+                                (agent_id, idem_key)).fetchone()
+        return row["result"] if row else None
+
+    def record_execution(self, agent_id: int, idem_key: str, tool: str, result: str) -> None:
+        self._update(
+            """INSERT OR IGNORE INTO tool_executions (agent_id, idem_key, tool, result, created_at)
+               VALUES (?, ?, ?, ?, ?)""", (agent_id, idem_key, tool, result, _now()))
 
     def pending_actions(self, agent_id: int | None = None) -> list[sqlite3.Row]:
         sql = "SELECT p.*, a.name AS agent FROM pending_actions p JOIN agents a ON a.id = p.agent_id WHERE p.status = 'pending'"
@@ -733,25 +789,30 @@ class Store:
         )
 
     def record_usage(self, customer_id: int, purpose: str, model: str, input_tokens: int, output_tokens: int,
-                     usd: float) -> None:
+                     usd: float, provider: str = "anthropic", simulated: bool = False) -> None:
         self._insert(
-            """INSERT INTO model_usage (customer_id, purpose, model, input_tokens, output_tokens, usd, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (customer_id, purpose, model, input_tokens, output_tokens, usd, _now()),
+            """INSERT INTO model_usage (customer_id, purpose, model, input_tokens, output_tokens, usd, provider,
+               simulated, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (customer_id, purpose, model, input_tokens, output_tokens, usd, provider, int(simulated), _now()),
         )
 
-    def month_spend(self, customer_id: int) -> float:
+    def month_spend(self, customer_id: int, simulated: bool | None = False) -> float:
+        """Estimated spend this calendar month. simulated=False: real model usage only (what the
+        budget limits); True: test-mode usage only; None: both."""
         month_start = utcnow().replace(day=1, hour=0, minute=0, second=0).isoformat()
-        return self.conn.execute(
-            "SELECT COALESCE(SUM(usd), 0) FROM model_usage WHERE customer_id = ? AND created_at >= ?",
-            (customer_id, month_start),
-        ).fetchone()[0]
+        sql = "SELECT COALESCE(SUM(usd), 0) FROM model_usage WHERE customer_id = ? AND created_at >= ?"
+        params: list = [customer_id, month_start]
+        if simulated is not None:
+            sql += " AND simulated = ?"
+            params.append(int(simulated))
+        return self.conn.execute(sql, params).fetchone()[0]
 
     def usage_by_purpose(self, customer_id: int, since: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT purpose, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens,
-                      SUM(output_tokens) AS output_tokens, SUM(usd) AS usd
-               FROM model_usage WHERE customer_id = ? AND created_at >= ? GROUP BY purpose ORDER BY usd DESC""",
+            """SELECT purpose, provider, MAX(simulated) AS simulated, COUNT(*) AS calls,
+                      SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(usd) AS usd
+               FROM model_usage WHERE customer_id = ? AND created_at >= ? GROUP BY purpose, provider
+               ORDER BY usd DESC""",
             (customer_id, since),
         ).fetchall()
 
@@ -810,7 +871,7 @@ class Store:
 
     def versions(self, agent_id: int) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT v.id, v.version, v.status, v.created_at,
+            """SELECT v.id, v.version, v.status, v.created_at, v.origin, v.provider, v.note,
                       (SELECT approved_by FROM approvals ap WHERE ap.agent_version_id = v.id ORDER BY id DESC LIMIT 1)
                           AS approved_by,
                       (SELECT created_at FROM approvals ap WHERE ap.agent_version_id = v.id ORDER BY id DESC LIMIT 1)

@@ -20,6 +20,9 @@ Review, test, release:
 Web application:
   agentgen serve [--port 8000]                  # then open http://127.0.0.1:8000
 
+First real-model evaluation (needs ANTHROPIC_API_KEY; separate database; hard spending cap):
+  agentgen live-eval --budget 5
+
 Operate:
   agentgen chat AGENT                           # interactive; approvals asked in the terminal
   agentgen trigger AGENT new_request --payload '{"text": "..."}'
@@ -37,7 +40,20 @@ from pathlib import Path
 import yaml
 
 from .components import catalog_description, is_consequential, risk_of
-from .llm import make_client
+from .config import default_budget_usd
+from .llm import make_provider
+from .providers.metering import metered
+
+
+def _provider(args, customer_id: int, purpose: str):
+    """The configured model provider, metered against the organisation's monthly budget."""
+    return metered(make_provider(), lambda: Store(args.db, migrate=False), customer_id, purpose,
+                   default_budget_usd())
+
+
+def _agent_customer(args, agent_name: str) -> int:
+    return _store(args).agent(agent_name)["customer_id"]
+from .providers import ModelError
 from .spec import AgentSpec
 from .store import Store
 
@@ -61,7 +77,7 @@ def cmd_project_new(args):
     customer_id = store.get_or_create_customer(args.customer)
     project_id = store.create_project(customer_id, args.title or Path(args.intake).stem, intake)
     print(f"Project #{project_id} created. Generating discovery questions...", file=sys.stderr)
-    discovery = generate_questions(make_client(), store, project_id)
+    discovery = generate_questions(_provider(args, customer_id, "requirements"), store, project_id)
     for i, q in enumerate(discovery.questions, 1):
         print(f"{i}. [{q.topic}] {q.question}\n   why: {q.why}")
     _err(f"\nAnswer with: agentgen project answer {project_id}")
@@ -93,7 +109,7 @@ def cmd_project_analyze(args):
 
     store = _store(args)
     _err("Analysing...")
-    a = analyze(make_client(), store, args.id)
+    a = analyze(_provider(args, store.project(args.id)["customer_id"], "requirements"), store, args.id)
     print(f"PROCESS\n  {a.process_summary}\n\nRECOMMENDED AGENT\n  {a.recommended_agent}")
     for cap in a.recommended_capabilities:
         print(f"  - {cap}")
@@ -129,7 +145,8 @@ def cmd_project_design(args):
     from .pipeline import design
 
     _err("Designing agent...")
-    spec, version = design(make_client(), _store(args), args.id)
+    store = _store(args)
+    spec, version = design(_provider(args, store.project(args.id)["customer_id"], "requirements"), store, args.id)
     _print_design_summary(spec, version)
 
 
@@ -157,7 +174,7 @@ def cmd_design(args):
     notes = Path(args.requirements).read_text(encoding="utf-8")
     customer_id = store.get_or_create_customer(args.customer)
     project_id = store.create_project(customer_id, Path(args.requirements).stem, notes)
-    client = make_client()
+    client = _provider(args, customer_id, "requirements")
     if args.analyze:
         _err("Analysing...")
         analyze(client, store, project_id)
@@ -227,7 +244,8 @@ def cmd_test(args):
         if args.verbose:
             print("       " + case.transcript.replace("\n", "\n       "))
 
-    report = evaluate(make_client(), _store(args), args.agent, args.version, args.threshold, on_case=show)
+    report = evaluate(_provider(args, _agent_customer(args, args.agent), "test"), _store(args), args.agent,
+                      args.version, args.threshold, on_case=show)
     print(f"\n{args.agent} v{report.version}: {report.pass_rate:.0%} of {len(report.cases)} cases passed "
           f"(threshold {report.threshold:.0%})")
     if report.avg_usd_per_run is not None:
@@ -271,7 +289,8 @@ def cmd_chat(args):
 
     store = _store(args)
     spec, version = store.deployed_spec(args.agent)
-    runtime = AgentRuntime(make_client(), store, store.agent(args.agent)["id"], spec, version,
+    runtime = AgentRuntime(_provider(args, store.agent(args.agent)["customer_id"], "run:live"), store,
+                           store.agent(args.agent)["id"], spec, version,
                            approver=_terminal_approver)
     if args.message:
         print(runtime.run(args.message).text)
@@ -296,14 +315,15 @@ def cmd_trigger(args):
     jobs = fire_event(store, args.agent, args.event, payload)
     print(f"Queued job(s) {', '.join(map(str, jobs))}.")
     if args.run_now:
-        for outcome in run_due_jobs(make_client(), store):
+        for outcome in run_due_jobs(None, store, provider_for=lambda cid: _provider(args, cid, "job")):
             print(outcome)
 
 
 def cmd_worker(args):
     from .worker import work
 
-    work(make_client(), _store(args), once=args.once, poll_seconds=args.poll)
+    work(None, _store(args), once=args.once, poll_seconds=args.poll,
+         provider_for=lambda cid: _provider(args, cid, "job"))
 
 
 def cmd_actions_list(args):
@@ -359,6 +379,14 @@ def cmd_tools(args):
         gate = "approval" if t.requires_approval else "automatic"
         print(f"  {t.name:<28} {t.component:<18} {risk_of(t):<15} {gate}")
     print(f"  consequential: {'yes' if is_consequential(spec.tools) else 'no'}")
+
+
+def cmd_live_eval(args):
+    from .live_eval import run_live_eval
+
+    result = run_live_eval(budget_usd=args.budget, workdir=args.dir, model=args.model, out=_err)
+    if not result["ok"] or not result["passed"]:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------- parser
@@ -484,6 +512,12 @@ def main(argv=None):
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_serve)
 
+    p = sub.add_parser("live-eval", help="First real-model evaluation (needs ANTHROPIC_API_KEY; capped spend)")
+    p.add_argument("--budget", type=float, default=5.0, help="Hard spending cap in USD (estimated, list prices)")
+    p.add_argument("--dir", help="Folder for the throwaway database and report (default: a new temp folder)")
+    p.add_argument("--model", help="Model to evaluate (default: AGENTGEN_DEFAULT_MODEL)")
+    p.set_defaults(func=cmd_live_eval)
+
     sub.add_parser("list", help="List agents").set_defaults(func=cmd_list)
     sub.add_parser("components", help="List the capability library").set_defaults(
         func=lambda a: print(catalog_description()))
@@ -493,6 +527,8 @@ def main(argv=None):
         args.func(args)
     except (KeyError, ValueError) as e:
         sys.exit(f"error: {e}")
+    except ModelError as e:
+        sys.exit(f"error: {e.user_message}")
 
 
 if __name__ == "__main__":

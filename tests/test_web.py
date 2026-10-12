@@ -32,7 +32,7 @@ INTAKE = {
 class Env:
     def __init__(self, tmp_path, model):
         self.model = model
-        self.app = create_app(str(tmp_path / "web.db"), client_factory=lambda: self.model, start_worker=False,
+        self.app = create_app(str(tmp_path / "web.db"), provider_factory=lambda: self.model, start_worker=False,
                               inline_operations=True)
 
     def client(self) -> TestClient:
@@ -96,7 +96,7 @@ def test_full_journey(env):
     agent_id, version = build_agent(c)
     project = ok(c.get("/api/projects"))[0]
     assert project["stage"] == "designed"
-    design_prompt = env.model.requests[2]["messages"][0]["content"]
+    design_prompt = env.model.requests[2]["prompt"]
     for expected in ("collecting figures from different sources", "about 3 hours every Monday",
                      "Revenue must exclude VAT", "dataset `orders` (12 rows)", "Nordhem Design"):
         assert expected in design_prompt, expected

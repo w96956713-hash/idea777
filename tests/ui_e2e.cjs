@@ -35,6 +35,7 @@ function step(name) { steps.push(name); console.log("·", name); }
     await page.getByRole("button", { name: "Create account" }).click();
     await page.getByRole("heading", { name: "Overview" }).waitFor();
     signedIn = true;
+    await waitText("A scripted test model is answering"); // test-mode banner: results are simulated
     await shot("01-overview-empty");
 
     step("upload sales data");
@@ -142,10 +143,55 @@ function step(name) { steps.push(name); console.log("·", name); }
     await shot("10-runs");
     await page.locator("tbody tr").first().click();
     await waitText("What the agent did");
+    await waitText("Simulated run.");
+    await waitText("Estimated cost");
     await shot("11-run-detail");
     await page.click('a[href="#/monitoring"]');
-    await waitText("Model spend this month");
+    await waitText("Test-mode model usage this month");
+    await waitText("not real spend");
     await shot("12-monitoring");
+
+    step("diagnose a run, apply a fix, add a test case, retest");
+    await page.click('a[href="#/runs"]');
+    await page.getByRole("heading", { name: "Execution history" }).waitFor();
+    await page.locator("tbody tr").first().click();
+    await waitText("Diagnosis");
+    await page.getByRole("button", { name: "Propose a fix" }).click();
+    await waitText("Proposed fix", 30000);
+    await page.getByRole("button", { name: "Apply as new version" }).click();
+    await waitText("Test cases · version 2");
+    await waitText("total is calculated");
+    await page.getByText("Add a test case", { exact: true }).click();
+    await page.getByPlaceholder("e.g. total revenue is correct").fill("stockholm revenue");
+    await page.locator("select").filter({ hasText: "quality" }).first().selectOption("quality");
+    await page.getByPlaceholder("The task or message the agent receives").fill("What was revenue in Stockholm?");
+    await page.getByPlaceholder("What a correct response does").fill("Gives Stockholm revenue from the data: 10 325 SEK.");
+    await page.getByPlaceholder("e.g. 20651 (comma-separated)").fill("10 325");
+    await page.getByRole("button", { name: "Add test case" }).click();
+    await waitText("Test cases · version 3");
+    await page.getByRole("button", { name: "Run test suite" }).click();
+    await waitText("All gates passed", 60000);
+    await waitText("These results come from the scripted test model");
+    await shot("12b-fixed-version-tested");
+
+    step("restore an earlier version as a draft");
+    await page.getByRole("link", { name: "Versions & deployment", exact: true }).click();
+    await waitText("Restoring a version");
+    await page.locator("tr", { hasText: "Restored from" }).count().then((n) => { if (n) throw new Error("nothing restored yet"); });
+    await page.locator("tbody tr").filter({ has: page.getByRole("link", { name: "v1", exact: true }) })
+      .getByRole("button", { name: "Restore as new draft" }).click();
+    await waitText("Test cases · version 4");
+    await page.getByRole("link", { name: "Versions & deployment", exact: true }).click();
+    await waitText("Restored from v1");
+    await shot("12c-restored");
+
+    step("settings show the model provider and a connection check");
+    await page.click('a[href="#/settings"]');
+    await waitText("AI model provider");
+    await waitText("scripted test model");
+    await page.getByRole("button", { name: "Check connection" }).click();
+    await waitText("Connection works");
+    await shot("12d-settings");
     for (const [href, title] of [["#/approvals", "Approvals"], ["#/testing", "Testing"], ["#/deployed", "Deployed agents"],
       ["#/settings", "Settings"], ["#/", "Overview"], ["#/agents", "Agents"], ["#/projects", "Projects"]]) {
       await page.click(`a[href="${href}"]`);

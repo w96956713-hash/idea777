@@ -182,3 +182,59 @@ The engine now has a web application (`agentgen/web/`, started with `agentgen se
 Verified offline: 33 pytest tests (engine + HTTP API, including isolation, approval enforcement, budget, failures) and a 13-step browser test of the full journey. Not verified: behaviour with the real model (no API key was available).
 
 Highest remaining production risks: unverified real-model quality and cost; SQLite and in-process worker (single server, no HA); application-level tenancy only; no delivery or inbound connectors; no SSO, password reset or email verification; secrets via environment variables; no backups or data-retention tooling.
+
+## 9. Status after preparing for the real Anthropic API
+
+The model is now behind a replaceable provider interface, and the lifecycle is complete through
+diagnosis, fixing and restoring. Everything was verified offline; **no real API call has been
+made**.
+
+- **Provider interface** (`agentgen/providers/`): `structured()` (schema-validated outputs for
+  everything the engine parses), `turn()` (agent tool use) and `check()` (no-token connection
+  test).
+  - **Anthropic provider**: built on the official SDK. The key comes only from `ANTHROPIC_API_KEY`;
+    requests are pinned to the official endpoint, streamed, and use structured outputs, prompt
+    caching and server-side model fallbacks.
+  - **Errors**: SDK errors become provider-neutral `ModelError`s, each with a message and a next
+    step for the user (key, billing, rate limit, timeout, overload, bad request, refusal,
+    malformed or cut-off output).
+  - **Configuration**: environment variables for the default and grader models, timeout and retries.
+- **Metering**: every provider is wrapped by a budget guard. It checks the month's spend plus
+  this call's projected cost *before* calling, then records provider-reported tokens and the
+  estimated cost.
+- **Simulated vs real**: every project stage, version, test report, run and usage row records
+  which provider produced it, and the scripted model is labelled *simulated* everywhere. Simulated
+  usage has its own budget line. Simulated test results can't approve or deploy on a real-model
+  server.
+- **Lifecycle**:
+  - discovery records missing information and contradictions, and passes them to analysis and design;
+  - test cases can be added (by hand or suggested by the model), removed, and checked exactly (`must_include`);
+  - failed runs and test cases get a deterministic diagnosis, and a model-proposed fix (with a
+    regression test) becomes a new draft version that must pass again;
+  - any version can be restored as a new draft, or rolled back to directly if it was approved.
+- **Safety**:
+  - **Inputs**: every tool input is validated against its schema before running.
+  - **Retried jobs**: each job is an idempotency scope, so actions from earlier attempts are not
+    repeated, and the job is told when a person already denied or failed an action.
+  - **Approvals**: claimed atomically, so an action runs once even if approved twice.
+  - **HTTP tool**: redirects are not followed, so a redirect can't reach internal addresses or
+    receive credentials.
+  - **Restarts**: interrupted jobs are retried after a restart.
+- **Bugs found by the offline evaluation suite and fixed**:
+  - discovery findings were dropped before analysis;
+  - whitespace-only required fields were accepted;
+  - reserved dataset names crashed the import;
+  - the row limit counted the header;
+  - extra CSV cells were silently dropped;
+  - a too-wide CSV destroyed the existing dataset;
+  - codes like `2026_01` became numbers;
+  - retried jobs were told that decided actions were still waiting.
+- **First real-model evaluation**: `agentgen live-eval --budget 5` checks the bundled sales agent
+  against known figures, with a hard cap and a separate database (docs/DEPLOYMENT.md).
+
+Next, in order:
+
+1. Run `agentgen live-eval` with a key and fix what the real model gets wrong.
+2. Move to Postgres with backups and row-level security.
+3. Add account recovery and MFA/SSO.
+4. Build the first delivery and inbound connectors chosen by a pilot customer.

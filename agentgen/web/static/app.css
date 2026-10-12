@@ -94,7 +94,7 @@ th { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; color:
 tr:last-child td { border-bottom: none; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: var(--accent-soft); }
-td.wrap { max-width: 420px; overflow-wrap: anywhere; }
+td.wrap { min-width: 18ch; max-width: 420px; overflow-wrap: anywhere; }
 .empty { padding: 22px; text-align: center; color: var(--muted); }
 
 /* badges & notices */
@@ -187,3 +187,12 @@ details[open] > summary { margin-bottom: 8px; }
 /* Grid children may shrink below their content's width, so wide tables scroll inside their
    own container instead of widening the page. */
 .content > *, .stack > *, .card > *, .grid-2 > *, .timeline > * { min-width: 0; }
+
+/* Test mode banner and diagnosis findings */
+.test-mode { background: var(--warn-soft); color: var(--warn); padding: 8px 28px; font-size: .88rem; border-bottom: 1px solid var(--line); }
+@media (max-width: 860px) { .test-mode { padding-inline: 16px; } }
+.finding { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; display: grid; gap: 4px; }
+.finding.error { border-left: 3px solid var(--bad); }
+.finding.warning { border-left: 3px solid var(--warn); }
+.finding.info { border-left: 3px solid var(--info); }
+select[multiple] { padding: 4px; }

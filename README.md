@@ -9,7 +9,9 @@ runtime with a shared capability library. Sales, service, research, BI, operatio
 finance and email agents are different combinations of the same components, not separate
 implementations.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the audit, architecture and roadmap.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the audit, architecture and roadmap, and
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for installation, configuration, adding the API key, the
+first real-model evaluation and the production blockers.
 
 ```
 intake ─► discovery questions ─► analysis ─► design ─► validate ─► test ─► approve ─► deploy ─► operate ─► monitor
@@ -27,6 +29,10 @@ export ANTHROPIC_API_KEY=...          # needed to generate, test and run agents 
 agentgen serve                         # http://127.0.0.1:8000
 ```
 
+Without a key the app still runs: everything that needs the model says so and stops before
+calling it. Settings → **AI model provider** shows whether a key is configured and has a
+**Check connection** button (Models API, no tokens).
+
 Create an account (this creates your organisation), then:
 
 1. **Data & integrations**: upload CSV exports (e.g. `examples/sales_insights/data/orders.csv` and
@@ -40,7 +46,8 @@ Create an account (this creates your organisation), then:
 5. **Versions & deployment**: approve a version whose tests passed (safety cases included) and deploy it.
    Then run live tasks, send events, and watch **Execution history**, **Approvals** and **Monitoring**.
 
-Settings has the monthly model budget (default $25); every model call is metered against it.
+Settings has the monthly model budget (default $25). Every model call is checked against it
+*before* it is sent, and its provider-reported tokens and estimated cost are recorded.
 `--no-worker` disables the background worker; `AGENTGEN_ALLOW_SIGNUP=0` disables sign-up;
 `AGENTGEN_SECURE_COOKIES=1` when served over HTTPS.
 
@@ -50,15 +57,55 @@ a clear "not called" result) and actions only touch a copy of the data. Messages
 no delivery connector exists, so nothing is actually sent. Live external API calls need the organisation's
 secret set on the server (`AGENTGEN_ORG<id>_<NAME>`, shown in Settings).
 
+## Model provider
+
+The engine talks to the model through a replaceable provider interface
+(`agentgen/providers/`): `structured()` for anything the engine parses (validated against a
+schema), `turn()` for agent tool-use turns, and `check()` for a no-token connection test. The
+Anthropic provider uses the official Python SDK, with the key read only from `ANTHROPIC_API_KEY`.
+Its errors are translated into messages a person can act on: missing or invalid key, billing,
+rate limits, timeouts, overloads, malformed or cut-off answers and refusals. Every provider is
+wrapped by a meter that enforces the budget and records usage.
+
+Results are always labelled with the provider that produced them. Output from the scripted test
+model is marked *simulated* everywhere: projects, versions, test reports, runs, usage and costs.
+Simulated test results can't approve or deploy a version on a server that uses the real model.
+
 ## Tests
 
 ```bash
-pytest                                         # 33 tests, offline, scripted model
+pytest                                         # offline: scripted model, mocked HTTP, no network
 AGENTGEN_UI_TEST=1 pytest tests/test_ui.py     # browser test of the full journey (Node.js + Playwright)
+agentgen live-eval --budget 5                  # the ONLY real-model check; needs a key (docs/DEPLOYMENT.md)
 ```
 
-The scripted model (`tests/fake_model.py`) stands in for Claude in tests only. Everything else — the
-database, pipeline, validation, runtime, tools, evaluation, approvals, worker and UI — is the real code.
+| Suite | What it covers |
+|---|---|
+| `test_agentgen.py` | Engine: specs, policy, components, runtime, evaluation, worker, SSRF and redirect blocking |
+| `test_web.py`, `test_lifecycle.py` | The HTTP API journey, permissions, isolation and budgets; test cases, diagnosis, fixes, retesting, restore, simulated-vs-real rules |
+| `test_provider.py` | The Anthropic provider against mocked HTTP: request shape, structured outputs, every error class, retries, no-token check, budget enforcement |
+| `test_eval_*.py` | Offline evaluation scenarios (see below) |
+| `test_live_eval.py` | The live-evaluation command, without calling the API |
+| `test_ui.py` | The whole journey in a real browser on a fresh server |
+
+The offline evaluation suite (`tests/test_eval_*.py`, helpers in `tests/scenario_kit.py`)
+replays fixed model decisions through the real platform, and checks the outcomes with exact
+assertions. It covers:
+
+- weekly sales CSV reporting and calculations;
+- customer request classification and routing, and property maintenance;
+- missing or contradictory information, and invalid datasets and malformed inputs;
+- permission violations and unauthorised actions;
+- external failures and timeouts;
+- unexpected model outputs;
+- regressions after changes.
+
+**These tests show that the platform enforces its rules. They say nothing about how well a real
+model performs.** Only `agentgen live-eval` and real use measure that.
+
+The scripted models (`tests/fake_model.py`, `tests/scenario_kit.py`) exist only as test doubles.
+Everything else (database, pipeline, validation, runtime, tools, evaluation, approvals, worker,
+UI) is the real code.
 
 ## What an agent can be built from
 
@@ -128,12 +175,20 @@ automatically.
   unauthorized_action, api_failure, edge_case.
 - Tests run on a sandbox copy of the agent's data. External APIs are never called: `fixtures`
   supply responses, `fail_tools` simulates outages.
-- A case passes when required tools were used, forbidden tools weren't attempted, the run ended
-  normally, and a grader model agrees with the expected behaviour.
+- A case passes only when all of these hold:
+  - the required tools were used and the forbidden ones weren't attempted;
+  - the answer contains the exact facts in `must_include` and none of `must_not_include`. These
+    checks need no model, and thousands separators are ignored;
+  - the run ended normally;
+  - a grader model agrees with the expected behaviour.
 - A version passes when ≥90% of cases pass, **every** safety case passes, and nothing that passed in
   the last passed version now fails (its cases are carried forward automatically).
 - Agents that can change records, act on external systems, communicate externally or move money also
   need a recorded approval (`agentgen approve`) before `deploy`. Rollback = deploy an older passed version.
+- Every failed run and failed test case gets a diagnosis: what happened and what to change. **Propose a fix**
+  asks the model for revised instructions or limits, plus a regression test that reproduces the failure.
+  Applying a fix, adding or removing test cases, or restoring an old version always creates a new draft
+  version. That draft must pass its tests again, including the new regression test, before it can be released.
 
 ## What is not built yet
 
@@ -153,4 +208,5 @@ These are stated honestly so nothing is mistaken for a working feature:
 - **Data residency.** It depends on where you deploy and which model provider agreement applies; no
   guarantee is implied by this code.
 - **Real-model verification.** No API key was available while building this, so no real Claude call has
-  been made. The offline tests use a scripted model; run the journey with a key to measure real quality.
+  been made. The Anthropic provider is tested against mocked HTTP only. Run `agentgen live-eval` with
+  a key to measure real quality and cost (docs/DEPLOYMENT.md, section 5).

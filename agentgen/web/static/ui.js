@@ -219,6 +219,10 @@ export function operationView(op, label) {
     return h("div", { class: "op" }, h("span", { class: "spinner", "aria-hidden": "true" }),
       `${label}… ${secs}s${prog}. Model calls can take a minute or two.`);
   }
-  if (op.status === "failed") return notice("bad", h("b", { text: `${label} failed` }), op.error || "Unknown error");
+  if (op.status === "failed") {
+    const retry = op.result && op.result.retryable
+      ? h("span", { class: "small", text: "This is usually temporary - try again in a minute." }) : null;
+    return notice("bad", h("b", { text: `${label} failed` }), op.error || "Unknown error", retry);
+  }
   return null;
 }

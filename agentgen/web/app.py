@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-import anthropic
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,20 +27,25 @@ from .. import datasets as datasets_mod
 from ..components import ALWAYS_APPROVE, CATALOG, is_consequential, org_secret, risk_of, secret_env_name
 from ..designer import validate_design
 from ..evaluate import evaluate
-from ..llm import (DEFAULT_MODEL, PRICES, BudgetExceeded, MeteredClient, ModelNotConfigured, RefusalError,
-                   cost_usd, make_client, model_configured)
+from ..config import default_budget_usd as configured_budget, model_settings
+from ..diagnose import (FixProposal, add_test_case, apply_fix, diagnose_case, diagnose_run, propose_fix,
+                        remove_test_case)
+from ..llm import DEFAULT_MODEL, PRICES, cost_usd, make_provider, model_configured
+from ..pipeline import provider_label, suggest_tests
+from ..providers import ModelError, ModelNotConfigured
+from ..providers.metering import metered as metered_provider
 from ..monitor import agent_metrics
 from ..pipeline import INTAKE_FIELDS, Analysis, analyze, compose_intake, design, estimate_monthly_cost
 from ..pipeline import generate_questions, record_answers
 from ..runtime import AgentRuntime, approve_all, execute_queued_action, queue_all
-from ..spec import SAFETY_CATEGORIES, AgentSpec, ConfigItem
+from ..spec import SAFETY_CATEGORIES, AgentSpec, ConfigItem, TestCase
 from ..store import Store, utcnow
-from ..worker import fire_event, run_due_jobs, schedule_due
+from ..worker import fire_event, recover_interrupted_jobs, run_due_jobs, schedule_due
 from . import auth
 
 log = logging.getLogger("agentgen.web")
 STATIC = Path(__file__).parent / "static"
-DEFAULT_BUDGET_USD = 25.0
+DEFAULT_BUDGET_USD = None  # from AGENTGEN_DEFAULT_BUDGET_USD (default 25)
 MAX_CSV_BYTES = 5_000_000
 MAX_DOC_BYTES = 1_000_000
 
@@ -119,6 +123,39 @@ class EventIn(BaseModel):
     payload: str = Field(default="", max_length=20000)
 
 
+class FixtureIn(BaseModel):
+    tool: str = Field(max_length=64)
+    response: str = Field(max_length=20000)
+
+
+class TestCaseIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    category: Literal["task", "quality", "tool_use", "missing_info", "permission", "unauthorized_action",
+                      "api_failure", "edge_case"]
+    input: str = Field(min_length=1, max_length=20000)
+    expected_behavior: str = Field(min_length=1, max_length=4000)
+    must_call: list[str] = Field(default_factory=list, max_length=20)
+    must_not_call: list[str] = Field(default_factory=list, max_length=20)
+    fail_tools: list[str] = Field(default_factory=list, max_length=20)
+    fixtures: list[FixtureIn] = Field(default_factory=list, max_length=20)
+    must_include: list[str] = Field(default_factory=list, max_length=20)
+    must_not_include: list[str] = Field(default_factory=list, max_length=20)
+
+
+class TestCasesIn(BaseModel):
+    cases: list[TestCaseIn] = Field(min_length=1, max_length=20)
+
+
+class FixRequestIn(BaseModel):
+    run_id: int | None = None
+    case_name: str | None = Field(default=None, max_length=120)
+    note: str = Field(default="", max_length=4000)
+
+
+class ApplyFixIn(BaseModel):
+    proposal: FixProposal
+
+
 class NoteIn(BaseModel):
     note: str = Field(default="", max_length=2000)
 
@@ -148,19 +185,13 @@ class SettingsIn(BaseModel):
 # ---------------------------------------------------------------- helpers
 
 def friendly_error(e: Exception) -> str:
-    if isinstance(e, (ModelNotConfigured, BudgetExceeded, RefusalError)):
-        return str(e)
-    if isinstance(e, anthropic.AuthenticationError):
-        return "The model provider rejected the server's API key."
-    if isinstance(e, anthropic.RateLimitError):
-        return "The model provider is rate limiting requests. Try again in a minute."
-    if isinstance(e, anthropic.APIConnectionError):
-        return "Could not reach the model provider."
-    if isinstance(e, anthropic.APIStatusError):
-        return f"Model provider error ({e.status_code}): {e.message}"
+    """A message a business user can act on. Provider errors carry their own; nothing else leaks
+    internals (full details go to the server log)."""
+    if isinstance(e, ModelError):
+        return e.user_message
     if isinstance(e, (ValueError, KeyError)):
         return str(e).strip("'\"")
-    return f"{type(e).__name__}: {e}"
+    return "Something went wrong on the server. The details are in the server log."
 
 
 def row(r) -> dict | None:
@@ -219,7 +250,7 @@ def report_summary(report: dict | None) -> dict | None:
 
 # ---------------------------------------------------------------- application
 
-def create_app(db_path: str | None = None, client_factory=None, default_budget_usd: float = DEFAULT_BUDGET_USD,
+def create_app(db_path: str | None = None, provider_factory=None, default_budget_usd: float | None = DEFAULT_BUDGET_USD,
                start_worker: bool = True, worker_poll_seconds: int = 15, inline_operations: bool = False,
                secure_cookies: bool | None = None, allow_signup: bool | None = None) -> FastAPI:
     db_path = db_path or os.environ.get("AGENTGEN_DB", "agentgen.db")
@@ -228,15 +259,16 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
     boot.fail_interrupted_operations()
     boot.close()
 
-    if client_factory is None:
-        def client_factory():
-            if not model_configured():
-                raise ModelNotConfigured("No model API key is configured on the server. Set ANTHROPIC_API_KEY "
-                                         "and restart to generate, test and run agents.")
-            return make_client()
+    if default_budget_usd is None:
+        default_budget_usd = configured_budget()
+    if provider_factory is None:
+        provider_factory = make_provider  # raises ModelNotConfigured without ANTHROPIC_API_KEY
         model_ready = model_configured
+        provider_meta = {"name": "anthropic", "simulated": False}
     else:
-        model_ready = lambda: True  # noqa: E731 - injected client (tests)
+        model_ready = lambda: True  # noqa: E731 - injected provider (tests)
+        probe = provider_factory()
+        provider_meta = {"name": probe.name, "simulated": bool(probe.simulated)}
 
     if secure_cookies is None:
         secure_cookies = os.environ.get("AGENTGEN_SECURE_COOKIES", "") == "1"
@@ -261,24 +293,15 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
     def open_store() -> Store:
         return Store(db_path, migrate=False)
 
-    def metered(customer_id: int, purpose: str) -> MeteredClient:
-        raw = client_factory()
+    def metered(customer_id: int, purpose: str):
+        """The model provider for one organisation and purpose: budget-checked before every call,
+        usage recorded after. Raises ModelNotConfigured without an API key."""
+        return metered_provider(provider_factory(), open_store, customer_id, purpose, default_budget_usd)
 
-        def spend_and_budget():
-            st = open_store()
-            try:
-                return st.month_spend(customer_id), st.monthly_budget(customer_id, default_budget_usd)
-            finally:
-                st.close()
-
-        def record(purpose_, model, tokens_in, tokens_out, usd):
-            st = open_store()
-            try:
-                st.record_usage(customer_id, purpose_, model, tokens_in, tokens_out, usd)
-            finally:
-                st.close()
-
-        return MeteredClient(raw, purpose, spend_and_budget, record)
+    def provider_status() -> dict:
+        s = model_settings()
+        return {**s.public(), "provider": provider_meta["name"], "simulated": provider_meta["simulated"],
+                "ready": model_ready(), "api_key_configured": s.api_key_present}
 
     # ------------------------------------------------------------ middleware & dependencies
 
@@ -356,8 +379,13 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
                 result = fn(ost, op_id)
                 ost.update_operation(op_id, "succeeded", result)
             except Exception as e:  # reported to the user through the operation
-                log.warning("operation %s (%s) failed: %s", op_id, kind, traceback.format_exc())
-                ost.update_operation(op_id, "failed", getattr(e, "op_result", None), friendly_error(e))
+                if isinstance(e, ModelError):
+                    log.warning("operation %s (%s) failed: %s", op_id, kind, e)
+                else:
+                    log.warning("operation %s (%s) failed: %s", op_id, kind, traceback.format_exc())
+                details = {**(getattr(e, "op_result", None) or {}), "error_kind": type(e).__name__,
+                           "retryable": bool(getattr(e, "retryable", False))}
+                ost.update_operation(op_id, "failed", details, friendly_error(e))
             finally:
                 ost.close()
 
@@ -427,7 +455,8 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
     @app.get("/api/me")
     def me(user=Depends(current_user)):
         return {"user": {k: user[k] for k in ("id", "name", "email", "role")}, "organization": user["organization"],
-                "model_configured": model_ready(), "signup_enabled": allow_signup}
+                "model_configured": model_ready(), "signup_enabled": allow_signup,
+                "provider": {"name": provider_meta["name"], "simulated": provider_meta["simulated"]}}
 
     @app.get("/api/users")
     def list_users(user=Depends(admin_user), st: Store = Depends(get_store)):
@@ -448,14 +477,31 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
     def get_settings(user=Depends(current_user), st: Store = Depends(get_store)):
         month_start = utcnow().replace(day=1, hour=0, minute=0, second=0).isoformat()
         return {
-            "model_configured": model_ready(), "default_model": DEFAULT_MODEL,
+            "model_configured": model_ready(), "default_model": model_settings().default_model,
+            "model": provider_status(),
             "prices_usd_per_mtok": {m: {"input": p[0], "output": p[1]} for m, p in PRICES.items()},
             "monthly_budget_usd": st.monthly_budget(user["customer_id"], default_budget_usd),
-            "month_spend_usd": round(st.month_spend(user["customer_id"]), 4),
+            "month_spend_usd": round(st.month_spend(user["customer_id"], simulated=provider_meta["simulated"]), 4),
+            "month_spend_real_usd": round(st.month_spend(user["customer_id"], simulated=False), 4),
+            "month_spend_simulated_usd": round(st.month_spend(user["customer_id"], simulated=True), 4),
             "usage_by_purpose": [dict(r) for r in st.usage_by_purpose(user["customer_id"], month_start)],
             "worker": {"enabled": start_worker, "poll_seconds": worker_poll_seconds, **worker_state},
             "secret_prefix": secret_env_name(user["customer_id"], ""),
         }
+
+    @app.post("/api/settings/check-model")
+    def check_model(user=Depends(admin_user)):
+        """Verify the API key and default model through the Models API. Uses no tokens."""
+        model = model_settings().default_model
+        try:
+            provider = provider_factory()
+        except ModelError as e:
+            return {"ok": False, "provider": provider_meta["name"], "model": model, "message": e.user_message}
+        status = provider.check(model)
+        if provider_meta["simulated"]:
+            status.message = "Test mode: a scripted test model is answering instead of a real model."
+        return {"ok": status.ok, "provider": status.provider, "model": status.model, "message": status.message,
+                "simulated": provider_meta["simulated"]}
 
     @app.put("/api/settings")
     def put_settings(body: SettingsIn, user=Depends(admin_user), st: Store = Depends(get_store)):
@@ -477,8 +523,9 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
             "runs_7d": len(recent),
             "failed_runs_7d": sum(1 for r in recent if r["stop_reason"] not in ("end_turn", None)),
             "pending_approvals": len(st.actions_for(cid)),
-            "month_spend_usd": round(st.month_spend(cid), 4),
+            "month_spend_usd": round(st.month_spend(cid, simulated=provider_meta["simulated"]), 4),
             "monthly_budget_usd": st.monthly_budget(cid, default_budget_usd),
+            "provider": {"name": provider_meta["name"], "simulated": provider_meta["simulated"]},
             "recent_runs": [run_row(st, r, {}) for r in runs[:8]],
             "running_operations": [op_payload(o) for o in st.operations_for(cid) if o["status"] in ("queued", "running")],
             "agents_needing_attention": [
@@ -502,6 +549,12 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
             "intake": json.loads(project["intake_json"]) if project["intake_json"] else {"problem": project["intake"]},
             "intake_text": project["intake"],
             "questions": json.loads(project["questions_json"])["questions"] if project["questions_json"] else [],
+            "missing_information": (json.loads(project["questions_json"]).get("missing_information", [])
+                                    if project["questions_json"] else []),
+            "contradictions": (json.loads(project["questions_json"]).get("contradictions", [])
+                               if project["questions_json"] else []),
+            "generated_by": {"questions": project["questions_provider"], "analysis": project["analysis_provider"],
+                             "design": project["design_provider"]},
             "answers": json.loads(project["answers_json"]) if project["answers_json"] else [],
             "analysis": analysis, "cost_estimate": estimate, "amendments": project["amendments"] or "",
             "agent": agent, "operations": [op_payload(o) for o in ops],
@@ -593,12 +646,23 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
                         "triggers": [t.kind for t in spec.triggers], "latest_test": report_summary(report)})
         return out
 
+    def simulated_results_block(report: dict | None) -> str | None:
+        """Test results produced by the scripted test model can't qualify a version on a server that
+        uses a real model."""
+        if report and report.get("simulated") and not provider_meta["simulated"]:
+            return ("These test results came from the scripted test model, not a real model. "
+                    "Run the tests again before approving or deploying.")
+        return None
+
     def version_payload(st: Store, user: dict, agent, spec: AgentSpec, version: int) -> dict:
         reports = st.test_reports(agent["name"], version, limit=1)
         latest = json.loads(reports[0]["report_json"]) if reports else None
         approval = st.approval_for(agent["name"], version)
         status = st.version_status(agent["name"], version)
         consequential = is_consequential(spec.tools)
+        blocked_simulated = simulated_results_block(latest)
+        vrow = st.conn.execute("SELECT origin, provider, note FROM agent_versions WHERE agent_id = ? AND version = ?",
+                               (agent["id"], version)).fetchone()
         return {
             "agent": {"id": agent["id"], "name": agent["name"], "deployed_version": agent["deployed_version"]},
             "version": version, "status": status, "spec": spec.model_dump(),
@@ -607,9 +671,12 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
             "approval": row(approval),
             "latest_test": latest, "latest_test_summary": report_summary(latest),
             "latest_test_at": reports[0]["created_at"] if reports else None,
-            "can_approve": status == "passed" and approval is None and consequential,
+            "can_approve": status == "passed" and approval is None and consequential and not blocked_simulated,
             "can_deploy": status == "passed" and (approval is not None or not consequential)
-                          and agent["deployed_version"] != version,
+                          and agent["deployed_version"] != version and not blocked_simulated,
+            "simulated_results_block": blocked_simulated,
+            "origin": vrow["origin"] if vrow else None, "generated_by": vrow["provider"] if vrow else None,
+            "version_note": vrow["note"] if vrow else None,
             "safety_categories": sorted(SAFETY_CATEGORIES),
             "models": list(PRICES),
         }
@@ -639,11 +706,13 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
         spec, _ = load_version(st, agent, version)
         return {"yaml": spec.to_yaml()}
 
-    def save_new_version(st: Store, user: dict, agent, spec: AgentSpec) -> dict:
+    def save_new_version(st: Store, user: dict, agent, spec: AgentSpec, origin: str = "edited",
+                         provider: str | None = None, note: str | None = None) -> dict:
         spec.name = agent["name"]
         spec = validate_design(spec)
-        version = st.save_version(user["customer_id"], spec)
-        st.audit(agent["id"], None, "version_created", {"version": version, "by": user["name"]})
+        version = st.save_version(user["customer_id"], spec, origin=origin, provider=provider,
+                                  note=note or f"{origin.replace('_', ' ').capitalize()} by {user['name']}")
+        st.audit(agent["id"], None, "version_created", {"version": version, "by": user["name"], "origin": origin})
         return {"version": version, "notes": spec.open_questions}
 
     @app.put("/api/agents/{agent_id}/versions/{version}/config")
@@ -676,7 +745,7 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
             spec.effort = body.effort
         if body.instructions is not None:
             spec.instructions = body.instructions
-        return save_new_version(st, user, agent, spec)
+        return save_new_version(st, user, agent, spec, origin="edited", note=f"Configuration edited from v{version}")
 
     @app.put("/api/agents/{agent_id}/spec")
     def replace_spec(agent_id: int, body: YamlIn, user=Depends(current_user), st: Store = Depends(get_store)):
@@ -685,7 +754,7 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
             spec = AgentSpec.from_yaml(body.yaml)
         except Exception as e:
             raise HTTPException(422, f"The spec is not valid: {str(e)[:1500]}")
-        return save_new_version(st, user, agent, spec)
+        return save_new_version(st, user, agent, spec, origin="imported")
 
     @app.post("/api/agents/{agent_id}/versions/{version}/test")
     def start_tests(agent_id: int, version: int, user=Depends(current_user), st: Store = Depends(get_store)):
@@ -710,8 +779,132 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
     def list_tests(agent_id: int, version: int, user=Depends(current_user), st: Store = Depends(get_store)):
         agent = scoped_agent(st, user, agent_id)
         load_version(st, agent, version)
-        return [{"id": r["id"], "created_at": r["created_at"], "report": json.loads(r["report_json"])}
-                for r in st.test_reports(agent["name"], version)]
+        out = []
+        for r in st.test_reports(agent["name"], version):
+            report = json.loads(r["report_json"])
+            for case in report.get("cases", []):
+                if not case.get("passed"):
+                    case["diagnosis"] = [f.model_dump() for f in diagnose_case(case)]
+            out.append({"id": r["id"], "created_at": r["created_at"], "report": report})
+        return out
+
+    # ---------------------------------------------------- test cases, diagnosis, fixes, restore
+
+    def to_case(body: TestCaseIn) -> TestCase:
+        return TestCase(**{**body.model_dump(), "fixtures": [f.model_dump() for f in body.fixtures]})
+
+    @app.post("/api/agents/{agent_id}/versions/{version}/test-cases")
+    def add_cases(agent_id: int, version: int, body: TestCasesIn, user=Depends(current_user),
+                  st: Store = Depends(get_store)):
+        agent = scoped_agent(st, user, agent_id)
+        spec, _ = load_version(st, agent, version)
+        existing = {c.name for c in spec.test_cases}
+        for case in body.cases:
+            if case.name in existing:
+                raise HTTPException(409, f"A test case named {case.name!r} already exists")
+            existing.add(case.name)
+        try:
+            for case in body.cases:
+                spec = add_test_case(spec, to_case(case))
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        names = ", ".join(c.name for c in body.cases)
+        return save_new_version(st, user, agent, spec, origin="tests_added",
+                                note=f"Added test case(s) {names} to v{version}")
+
+    @app.delete("/api/agents/{agent_id}/versions/{version}/test-cases/{name}")
+    def delete_case(agent_id: int, version: int, name: str, user=Depends(current_user),
+                    st: Store = Depends(get_store)):
+        agent = scoped_agent(st, user, agent_id)
+        spec, _ = load_version(st, agent, version)
+        try:
+            spec = remove_test_case(spec, name)
+        except KeyError as e:
+            raise HTTPException(404, str(e).strip("'\""))
+        return save_new_version(st, user, agent, spec, origin="tests_removed",
+                                note=f"Removed test case {name} from v{version}")
+
+    @app.post("/api/agents/{agent_id}/versions/{version}/suggest-tests")
+    def start_suggest_tests(agent_id: int, version: int, user=Depends(current_user), st: Store = Depends(get_store)):
+        agent = scoped_agent(st, user, agent_id)
+        spec, version = load_version(st, agent, version)
+        cid = user["customer_id"]
+
+        def work(ost, op_id):
+            provider = metered(cid, "requirements")
+            cases = suggest_tests(provider, spec)
+            return {"cases": [c.model_dump() for c in cases], "generated_by": provider_label(provider)}
+
+        return start_operation(st, user, "suggest_tests", {"agent_id": agent_id, "version": version}, work)
+
+    @app.get("/api/runs/{run_id}/diagnosis")
+    def run_diagnosis(run_id: int, user=Depends(current_user), st: Store = Depends(get_store)):
+        if st.run_scoped(user["customer_id"], run_id) is None:
+            raise HTTPException(404, "Run not found")
+        return [f.model_dump() for f in diagnose_run(st, run_id)]
+
+    def failure_evidence(st: Store, user: dict, agent, version: int, body: FixRequestIn) -> str:
+        if body.run_id is not None:
+            r = st.run_scoped(user["customer_id"], body.run_id)
+            if r is None or r["agent_id"] != agent["id"]:
+                raise HTTPException(404, "Run not found")
+            steps = []
+            for e in st.run_events(body.run_id):
+                if e["event"] in ("tool_call", "tool_error", "tool_blocked", "approval", "run_failed"):
+                    steps.append(f"{e['event']}: {e['data_json'][:1500]}")
+            findings = "\n".join(f"- {f.title}: {f.detail}" for f in diagnose_run(st, body.run_id))
+            return (f"Run #{r['id']} (version {r['version']}), outcome {r['stop_reason']}, error: {r['error'] or 'none'}\n"
+                    f"Task:\n{r['input']}\n\nSteps:\n" + "\n".join(steps)
+                    + f"\n\nFinal answer:\n{r['output'] or ''}\n\nPlatform diagnosis:\n{findings}"
+                    + (f"\n\nWhat the customer says is wrong:\n{body.note}" if body.note else ""))
+        if body.case_name:
+            report = st.latest_test_report(agent["name"], version) or {}
+            case = next((c for c in report.get("cases", []) if c["name"] == body.case_name), None)
+            spec, _ = st.load_spec(agent["name"], version)
+            definition = next((c for c in spec.test_cases if c.name == body.case_name), None)
+            if case is None:
+                raise HTTPException(404, "Test case result not found")
+            return (f"Failed test case {case['name']} ({case['category']}).\n"
+                    f"Expected behaviour: {definition.expected_behavior if definition else '?'}\n"
+                    f"Checks: {case['tool_check']}\nGrader: {case['judge_reasoning']}\nError: {case.get('error') or 'none'}\n"
+                    f"Transcript:\n{case['transcript']}"
+                    + (f"\n\nWhat the customer says is wrong:\n{body.note}" if body.note else ""))
+        if body.note:
+            return f"What the customer says is wrong:\n{body.note}"
+        raise HTTPException(422, "Give a run, a failed test case or a description of the problem")
+
+    @app.post("/api/agents/{agent_id}/versions/{version}/propose-fix")
+    def start_propose_fix(agent_id: int, version: int, body: FixRequestIn, user=Depends(current_user),
+                          st: Store = Depends(get_store)):
+        agent = scoped_agent(st, user, agent_id)
+        spec, version = load_version(st, agent, version)
+        evidence = failure_evidence(st, user, agent, version, body)
+        cid = user["customer_id"]
+
+        def work(ost, op_id):
+            provider = metered(cid, "fix")
+            proposal = propose_fix(provider, spec, evidence)
+            return {"proposal": proposal.model_dump(), "generated_by": provider_label(provider), "version": version}
+
+        target = {"agent_id": agent_id, "version": version, "run_id": body.run_id, "case": body.case_name}
+        return start_operation(st, user, "propose_fix", target, work)
+
+    @app.post("/api/agents/{agent_id}/versions/{version}/apply-fix")
+    def apply_fix_endpoint(agent_id: int, version: int, body: ApplyFixIn, user=Depends(current_user),
+                           st: Store = Depends(get_store)):
+        agent = scoped_agent(st, user, agent_id)
+        spec, version = load_version(st, agent, version)
+        new = apply_fix(spec, body.proposal)
+        return save_new_version(st, user, agent, new, origin="fixed",
+                                note=f"Fix applied to v{version}: {body.proposal.diagnosis[:300]}")
+
+    @app.post("/api/agents/{agent_id}/versions/{version}/restore")
+    def restore_version(agent_id: int, version: int, user=Depends(current_user), st: Store = Depends(get_store)):
+        """Copy an earlier version as a new draft (it must pass its tests again before release)."""
+        agent = scoped_agent(st, user, agent_id)
+        spec, version = load_version(st, agent, version)
+        return save_new_version(st, user, agent, spec.model_copy(deep=True), origin="restored",
+                                note=f"Restored from v{version} by {user['name']}")
 
     @app.post("/api/agents/{agent_id}/versions/{version}/approve")
     def approve_version(agent_id: int, version: int, body: NoteIn, user=Depends(admin_user),
@@ -719,6 +912,8 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
         agent = scoped_agent(st, user, agent_id)
         load_version(st, agent, version)
         report = st.latest_test_report(agent["name"], version)
+        if simulated_results_block(report):
+            raise HTTPException(400, simulated_results_block(report))
         if not report or not report.get("passed") or not report.get("has_safety_cases"):
             raise HTTPException(400, "Only versions whose latest test run passed, including all safety and "
                                      "permission tests, can be approved")
@@ -733,6 +928,9 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
     def deploy(agent_id: int, body: DeployIn, user=Depends(admin_user), st: Store = Depends(get_store)):
         agent = scoped_agent(st, user, agent_id)
         spec, version = load_version(st, agent, body.version)
+        blocked = simulated_results_block(st.latest_test_report(agent["name"], version))
+        if blocked:
+            raise HTTPException(400, blocked)
         try:
             st.deploy(agent["name"], version, requires_approval=is_consequential(spec.tools))
         except ValueError as e:
@@ -760,7 +958,7 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
         name = agent["name"]
 
         def work(ost, op_id):
-            client = metered(cid, f"run:{body.mode}")
+            client = metered(cid, f"run:{body.mode}")  # a ModelProvider
             real_agent = ost.agent(name)
             if body.mode == "sandbox":
                 data_store, data_agent_id = ost.sandbox_for(name)
@@ -813,7 +1011,8 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
                           ("completed" if r["stop_reason"] == "end_turn" else "failed"),
                 "input": r["input"][:300], "duration_ms": r["duration_ms"], "input_tokens": r["input_tokens"],
                 "output_tokens": r["output_tokens"], "cost_usd": cost_usd(model, r["input_tokens"], r["output_tokens"]),
-                "error": r["error"], "created_at": r["created_at"]}
+                "error": r["error"], "created_at": r["created_at"], "provider": r["provider"],
+                "simulated": bool(r["simulated"])}
 
     @app.get("/api/runs")
     def list_runs(agent_id: int | None = None, source: str | None = None, status: str | None = None,
@@ -884,8 +1083,9 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
             "agents": [agent_metrics(st, a["name"], days) | {"id": a["id"]} for a in st.agents_for(cid)],
             "usage": [dict(r) for r in st.usage_by_purpose(cid, since)],
             "failed_jobs": [dict(j) for j in st.jobs_for(cid) if j["status"] == "failed"][:20],
-            "month_spend_usd": round(st.month_spend(cid), 4),
+            "month_spend_usd": round(st.month_spend(cid, simulated=provider_meta["simulated"]), 4),
             "monthly_budget_usd": st.monthly_budget(cid, default_budget_usd),
+            "simulated": provider_meta["simulated"],
         }
 
     # ------------------------------------------------------------ data & integrations
@@ -962,11 +1162,15 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
         st = open_store()
         worker_state["running"] = True
         try:
+            try:
+                recover_interrupted_jobs(st)
+            except Exception:  # never stop the worker over this
+                log.exception("recovering interrupted jobs failed")
             while not stop_worker.is_set():
                 try:
                     schedule_due(st)
                     if model_ready():
-                        run_due_jobs(None, st, client_for=lambda cid: metered(cid, "job"))
+                        run_due_jobs(None, st, provider_for=lambda cid: metered(cid, "job"))
                     st.purge_expired_memory()
                     worker_state["last_tick"] = utcnow().isoformat()
                     worker_state["last_error"] = None
@@ -978,5 +1182,5 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
             worker_state["running"] = False
             st.close()
 
-    app.state.run_worker_once = lambda: run_due_jobs(None, open_store(), client_for=lambda cid: metered(cid, "job"))
+    app.state.run_worker_once = lambda: run_due_jobs(None, open_store(), provider_for=lambda cid: metered(cid, "job"))
     return app

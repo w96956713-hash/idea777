@@ -85,6 +85,10 @@ function renderShell() {
     NAV.map(([label, href]) => href ? h("a", { href, "data-href": href }, h("span", { text: label }),
       href === "#/approvals" ? h("span", { class: "count", id: "nav-approvals", hidden: true }) : null)
       : h("div", { class: "group", text: label })));
+  const testMode = state.me.provider?.simulated
+    ? h("div", { class: "test-mode", role: "status" }, h("b", { text: "Test mode." }),
+      " A scripted test model is answering instead of a real AI model. Results here do not show real AI performance.")
+    : null;
   const shell = h("div", { class: "shell" },
     h("aside", { class: "sidebar" },
       h("div", { class: "brand" }, "agentgen", h("small", { text: "AI agent platform" })),
@@ -94,6 +98,7 @@ function renderShell() {
     h("div", { class: "main" },
       h("div", { class: "topbar" }, h("button", { class: "small", type: "button", onclick: () => shell.classList.toggle("menu-open") }, "Menu"),
         h("b", { text: "agentgen" })),
+      testMode,
       view = h("div", { class: "content", id: "view" })));
   nav.addEventListener("click", (e) => { if (e.target.closest("a")) shell.classList.remove("menu-open"); });
   root.replaceChildren(shell);
@@ -165,9 +170,9 @@ window.addEventListener("hashchange", render);
 
 function modelNotice(configured) {
   if (configured) return null;
-  return notice("warn", h("b", { text: "No model API key is configured on this server." }),
-    "Generating questions, analysing requirements, generating agents, testing and running them need the Claude API. " +
-    "Set ANTHROPIC_API_KEY in the server's environment and restart. Everything else works without it.");
+  return notice("warn", h("b", { text: "AI features need an API key on the server." }),
+    "Asking questions, analysing requirements, generating agents, suggesting tests, proposing fixes, testing and running agents use the Claude API. " +
+    "An administrator sets ANTHROPIC_API_KEY in the server's environment and restarts it (see Settings). Everything else works without it.");
 }
 
 function runsTable(runs, { showAgent = true } = {}) {
@@ -175,12 +180,12 @@ function runsTable(runs, { showAgent = true } = {}) {
     { label: "Run", render: (r) => h("a", { href: `#/runs/${r.id}`, text: `#${r.id}` }) },
     showAgent ? { label: "Agent", class: "nowrap", render: (r) => h("a", { href: `#/agents/${r.agent_id}`, text: r.agent }) } : null,
     { label: "Version", render: (r) => `v${r.version}` },
-    { label: "Source", render: (r) => sourceBadge(r.source) },
+    { label: "Source", render: (r) => h("span", { class: "row" }, sourceBadge(r.source), simBadge(r)) },
     { label: "Status", render: (r) => statusBadge(r.status) },
     { label: "Task", class: "wrap", render: (r) => r.input.length > 90 ? r.input.slice(0, 90) + "…" : r.input },
     { label: "Duration", class: "nowrap", render: (r) => fmt.ms(r.duration_ms) },
     { label: "Tokens", class: "nowrap", render: (r) => `${fmt.tokens(r.input_tokens)} / ${fmt.tokens(r.output_tokens)}` },
-    { label: "Cost", render: (r) => fmt.usd(r.cost_usd) },
+    { label: "Est. cost", render: (r) => fmt.usd(r.cost_usd) },
     { label: "Started", class: "nowrap", render: (r) => fmt.ago(r.created_at) },
   ].filter(Boolean), runs, { empty: "No runs yet.", onRow: (r) => go(`#/runs/${r.id}`) });
 }
@@ -306,7 +311,7 @@ async function pageProject({ params: [id], isCurrent }) {
     const op = await api("POST", `/projects/${id}/${path}`);
     if (op.status === "failed") throw new Error(op.error);
     render();
-  }, { kind: "primary", disabled: !!running || !me.model_configured });
+  }, { kind: "primary", disabled: !!running || !me.model_configured, title: me.model_configured ? null : "Needs the model API key on the server" });
 
   const opStatus = (kind, label) => operationView(latest(kind), label);
   const steps = [
@@ -360,14 +365,17 @@ async function pageProject({ params: [id], isCurrent }) {
     h("div", { class: "row" }, h("button", { class: "primary", type: "submit" }, "Save answers"),
       h("span", { class: "small muted", text: "Leave a question blank if you don't know; it is treated as unknown." })))
     : h("p", { class: "muted", text: "Generate targeted questions about the process, data, rules and risks before anything is designed." });
-  const qCard = card(stepTitle(3, "Follow-up questions", p.questions.length > 0),
-    "Answers sharpen the analysis and the agent design.", [opStatus("questions", "Generating questions"), qBody],
+  const discovered = (p.missing_information.length || p.contradictions.length) ? h("div", { class: "grid-2" },
+    p.missing_information.length ? notice("info", h("b", { text: "Information still missing" }), list(p.missing_information)) : null,
+    p.contradictions.length ? notice("warn", h("b", { text: "Contradictions to resolve" }), list(p.contradictions)) : null) : null;
+  const qCard = card(h("h2", {}, h("span", { class: `step-num${p.questions.length ? " done" : ""}`, text: "3" }), "Follow-up questions ", genBadge(p.generated_by.questions)),
+    "Answers sharpen the analysis and the agent design.", [opStatus("questions", "Generating questions"), discovered, qBody],
     [start("questions", p.questions.length ? "Regenerate questions" : "Generate questions")]);
 
   // 4. analysis
   const a = p.analysis;
   const aBody = a ? analysisView(a, p.cost_estimate) : h("p", { class: "muted", text: "Analyse which steps can be automated safely, which should stay with people, which systems are needed and what it costs." });
-  const aCard = card(stepTitle(4, "Analysis", !!a), "What to automate, what stays human, integrations and risks.",
+  const aCard = card(h("h2", {}, h("span", { class: `step-num${a ? " done" : ""}`, text: "4" }), "Analysis ", genBadge(p.generated_by.analysis)), "What to automate, what stays human, integrations and risks.",
     [opStatus("analysis", "Analysing"), aBody], [start("analysis", a ? "Re-analyse" : "Analyse requirements")]);
 
   // 5. review
@@ -388,7 +396,7 @@ async function pageProject({ params: [id], isCurrent }) {
       "Review its configuration and run its tests: ", h("a", { href: `#/agents/${p.agent.id}`, text: "open the agent" }), "."))
     : h("p", { class: "muted", text: a ? "Ready to design the agent from the requirements, answers, analysis, corrections and available data."
       : "Analysing first is recommended; you can also generate directly from the requirements." });
-  const gCard = card(stepTitle(6, "Generate the agent", !!p.agent),
+  const gCard = card(h("h2", {}, h("span", { class: `step-num${p.agent ? " done" : ""}`, text: "6" }), "Generate the agent ", genBadge(p.generated_by.design)),
     "Creates a new, versioned agent definition. Generating again creates a new version of the same agent.",
     [opStatus("design", "Designing the agent"), gBody],
     [start("design", p.agent ? "Generate a new version" : "Generate agent")]);
@@ -475,6 +483,8 @@ async function pageAgent({ params: [id, tab = "overview", v], isCurrent }) {
 function tabOverview({ base, ver }) {
   const s = ver.spec;
   return [
+    h("div", { class: "row small muted" }, `Version ${ver.version}: `, badge((ver.origin || "generated").replaceAll("_", " ")), genBadge(ver.generated_by),
+      ver.version_note ? h("span", { text: ver.version_note }) : null),
     s.open_questions.length ? notice("warn", h("b", { text: "Open questions and validation notes" }), list(s.open_questions)) : null,
     h("div", { class: "grid-2" },
       card("Responsibilities", null, [list(s.capabilities)]),
@@ -563,47 +573,90 @@ function tabConfig({ id, ver, version }) {
   ];
 }
 
-function testCase(c) {
+function testCase(c, { agentId, version, isCurrent }) {
+  const fixBox = h("div");
   return h("div", { class: `case ${c.passed ? "pass" : "fail"}` },
     h("div", { class: "row between" }, h("div", { class: "row" }, h("b", { text: c.name }), badge(c.category.replaceAll("_", " "), ["permission", "unauthorized_action"].includes(c.category) ? "warn" : "info"),
       c.carried ? badge("regression suite") : null), c.passed ? badge("passed", "ok") : badge("failed", "bad")),
     c.error ? notice("bad", c.error) : null,
-    kv([["Tool check", c.tool_check], ["Grader", c.judge_reasoning || "—"],
-      ["Tokens / cost", `${fmt.tokens(c.input_tokens)} in, ${fmt.tokens(c.output_tokens)} out · ${fmt.usd(c.usd)}`]]),
-    c.transcript ? h("details", {}, h("summary", { text: "What the agent did" }), h("pre", { text: c.transcript })) : null);
+    kv([["Checks", c.tool_check], ["Grader", c.judge_reasoning || "—"],
+      ["Tokens / est. cost", `${fmt.tokens(c.input_tokens)} in, ${fmt.tokens(c.output_tokens)} out · ${fmt.usd(c.usd)}`]]),
+    c.diagnosis?.length ? h("details", { open: true }, h("summary", { text: "Diagnosis" }), findingsView(c.diagnosis)) : null,
+    c.transcript ? h("details", {}, h("summary", { text: "What the agent did" }), h("pre", { text: c.transcript })) : null,
+    !c.passed && !c.carried ? h("div", { class: "row" }, actionButton("Propose a fix", () => proposeFix(agentId, version, { case_name: c.name }, fixBox, isCurrent), { small: true, ...needsModel() })) : null,
+    fixBox);
 }
 
 async function tabTests({ id, ver, version, isCurrent }) {
   const [reports, me] = await Promise.all([api("GET", `/agents/${id}/versions/${version}/tests`), api("GET", "/me")]);
   const latest = reports[0]?.report;
   const opBox = h("div");
+  const toolNames = ver.tools.map((t) => t.name);
   const runBtn = actionButton("Run test suite", async () => {
     let op = await api("POST", `/agents/${id}/versions/${version}/test`);
     op = await waitForOperation(op, (o) => setChildren(opBox, operationView(o, "Running tests")), isCurrent);
-    if (op.status === "failed") toast(`Tests failed to run: ${op.error}`, "bad");
-    if (isCurrent()) render();
-  }, { kind: "primary", disabled: !me.model_configured });
-  const cases = ver.spec.test_cases;
+    if (op.status === "failed") setChildren(opBox, operationView(op, "Running tests"));
+    else if (isCurrent()) render();
+  }, { kind: "primary", ...needsModel() });
+
   const summary = latest ? h("div", { class: "stack" },
+    latest.simulated ? notice("warn", h("b", { text: "These results come from the scripted test model." }),
+      "They check the platform's rules, not real AI performance." + (ver.simulated_results_block ? " " + ver.simulated_results_block : "")) : null,
     h("div", { class: "row" }, latest.passed ? badge("Passed", "ok") : badge("Did not pass", "bad"),
       h("span", { text: `${latest.cases.filter((c) => c.passed).length} of ${latest.cases.length} cases passed (${fmt.pct(latest.pass_rate)}, threshold ${fmt.pct(latest.threshold)})` }),
-      h("span", { class: "muted", text: `· ${fmt.ago(reports[0].created_at)} · avg ${fmt.usd(latest.avg_usd_per_run)} per run` })),
+      h("span", { class: "muted", text: `· ${fmt.ago(reports[0].created_at)} · est. ${fmt.usd(latest.avg_usd_per_run)} per run` })),
     progress(latest.pass_rate, latest.passed ? "" : "bad"),
     latest.blockers.length ? notice("bad", h("b", { text: "Why it can't be approved yet" }), list(latest.blockers)) : notice("ok", "All gates passed: pass rate, safety and permission cases, no regressions."),
     latest.over_budget?.length ? notice("warn", `Over the token budget: ${latest.over_budget.join(", ")}`) : null)
     : h("p", { class: "muted", text: "This version hasn't been tested yet." });
+
+  // Planned cases with remove buttons, plus manual and suggested additions (each saves a new version).
+  const planned = table([
+    { label: "Case", key: "name" }, { label: "Category", render: (c) => badge(c.category.replaceAll("_", " ")) },
+    { label: "Input", class: "wrap", render: (c) => c.input.slice(0, 160) }, { label: "Expected", class: "wrap", key: "expected_behavior" },
+    { label: "Checks", class: "wrap", render: (c) => [c.must_include?.length ? `contains: ${c.must_include.join(", ")}` : "", c.must_call.length ? `uses: ${c.must_call.join(", ")}` : "", c.fail_tools.length ? `outage: ${c.fail_tools.join(", ")}` : ""].filter(Boolean).join("; ") || "grader only" },
+    { label: "", render: (c) => actionButton("Remove", async () => {
+      const r = await api("DELETE", `/agents/${id}/versions/${version}/test-cases/${encodeURIComponent(c.name)}`);
+      toast(`Removed. Saved as version ${r.version}.`); go(`#/agents/${id}/tests/v${r.version}`);
+    }, { small: true, kind: "danger", confirmText: "Confirm remove" }) },
+  ], ver.spec.test_cases, { empty: "No test cases." });
+
+  const suggestBox = h("div");
+  const suggestBtn = actionButton("Suggest more test cases", async () => {
+    let op = await api("POST", `/agents/${id}/versions/${version}/suggest-tests`);
+    op = await waitForOperation(op, (o) => setChildren(suggestBox, operationView(o, "Writing test cases")), isCurrent);
+    if (!isCurrent()) return;
+    if (op.status === "failed") { setChildren(suggestBox, operationView(op, "Writing test cases")); return; }
+    const picks = op.result.cases.map((c) => [c, h("input", { type: "checkbox", checked: true })]);
+    setChildren(suggestBox, h("div", { class: "stack" },
+      h("div", { class: "row" }, h("b", { text: "Suggested test cases" }), genBadge(op.result.generated_by)),
+      picks.map(([c, box]) => h("label", { class: "radio-card" }, box, h("b", { text: `${c.name} · ${c.category.replaceAll("_", " ")}` }), h("span"),
+        h("span", { class: "small muted", text: `${c.input} → ${c.expected_behavior}` }))),
+      h("div", { class: "row" }, actionButton("Add selected as new version", async () => {
+        const cases = picks.filter(([, box]) => box.checked).map(([c]) => c);
+        if (!cases.length) throw new Error("Select at least one test case.");
+        const r = await api("POST", `/agents/${id}/versions/${version}/test-cases`, { cases });
+        toast(`Saved as version ${r.version}. Run its tests next.`); go(`#/agents/${id}/tests/v${r.version}`);
+      }, { kind: "primary" }))));
+  }, needsModel());
+
+  const addForm = testCaseForm(toolNames, { onSave: async (c) => {
+    const r = await api("POST", `/agents/${id}/versions/${version}/test-cases`, { cases: [c] });
+    toast(`Added. Saved as version ${r.version}.`); go(`#/agents/${id}/tests/v${r.version}`);
+  } });
+
   return [
     modelNotice(me.model_configured),
     card(`Test results · version ${version}`, "Each case runs on a copy of your data with approvals granted. External systems are never called: they're simulated. " +
       "Safety and permission cases must all pass before a version can be approved.", [opBox, summary], [runBtn]),
-    latest ? card("Cases", null, [h("div", { class: "stack" }, latest.cases.map(testCase))]) : card("Planned test cases", null, [table([
-      { label: "Case", key: "name" }, { label: "Category", render: (c) => badge(c.category.replaceAll("_", " ")) },
-      { label: "Input", class: "wrap", render: (c) => c.input.slice(0, 160) }, { label: "Expected", class: "wrap", key: "expected_behavior" },
-      { label: "Simulated", render: (c) => [c.fail_tools.length ? `outage: ${c.fail_tools.join(", ")}` : "", c.fixtures.length ? `fixtures: ${c.fixtures.map((f) => f.tool).join(", ")}` : ""].filter(Boolean).join("; ") || "—" },
-    ], cases)]),
+    latest ? card("Results by case", null, [h("div", { class: "stack" }, latest.cases.map((c) => testCase(c, { agentId: id, version, isCurrent })))]) : null,
+    card(`Test cases · version ${version}`, "Adding or removing a case saves a new version, which must be tested again.", [
+      planned,
+      h("details", {}, h("summary", { text: "Add a test case" }), addForm),
+      h("div", { class: "row" }, suggestBtn), suggestBox]),
     reports.length > 1 ? card("Earlier test runs", null, [table([
       { label: "When", render: (r) => fmt.date(r.created_at) },
-      { label: "Result", render: (r) => r.report.passed ? badge("passed", "ok") : badge("failed", "bad") },
+      { label: "Result", render: (r) => h("span", { class: "row" }, r.report.passed ? badge("passed", "ok") : badge("failed", "bad"), r.report.simulated ? badge("simulated", "warn") : null) },
       { label: "Pass rate", render: (r) => fmt.pct(r.report.pass_rate) },
       { label: "Blockers", class: "wrap", render: (r) => r.report.blockers.join("; ") || "—" },
     ], reports.slice(1))]) : null,
@@ -629,7 +682,7 @@ async function tabRun({ id, base, ver, version, isCurrent }) {
     const run = runId ? await api("GET", `/runs/${runId}`) : null;
     setChildren(result,
       op.status === "failed" ? notice("bad", h("b", { text: "The run failed" }), op.error) : null,
-      run ? runDetail(run, { compact: true }) : null);
+      run ? runDetail(run, { compact: true, isCurrent }) : null);
   }, { kind: "primary", disabled: !me.model_configured });
   return [
     modelNotice(me.model_configured),
@@ -661,6 +714,8 @@ async function tabDeploy({ id, base, ver }) {
       "Deployed agents run on this server: live runs, scheduled triggers, events and follow-ups use the deployed version, " +
       "processed by the built-in worker. There is no separate production hosting yet."),
     admin ? null : notice("warn", "Only administrators can approve and deploy versions."),
+    notice("info", h("b", { text: "Restoring a version" }), "To go back to an earlier version immediately, deploy it again (Roll back to this): it keeps its tests and approval. " +
+      "To change an earlier version, Restore it as a new draft, which must be tested and approved before release."),
     card("Versions", "A version can be approved after its latest test run passed, including every safety and permission case. " +
       "Agents that can change records, act on external systems, send messages or move money need a recorded approval before deployment.", [
       field("Approval note", note),
@@ -670,13 +725,21 @@ async function tabDeploy({ id, base, ver }) {
         { label: "Tests", render: (v) => v.pass_rate === null ? "not run" : fmt.pct(v.pass_rate) },
         { label: "Approval", render: (v) => v.approved_by ? `${v.approved_by}, ${fmt.date(v.approved_at)}` : (versionPayloads[v.version]?.consequential === false ? "not needed" : "—") },
         { label: "Deployed", render: (v) => v.version === deployed ? badge("live", "ok") : "" },
+        { label: "Origin", class: "wrap", render: (v) => h("div", {}, h("span", { class: "row" }, badge((v.origin || "generated").replaceAll("_", " ")), genBadge(v.provider)),
+          v.note ? h("div", { class: "small muted", text: v.note }) : null) },
         { label: "Created", render: (v) => fmt.ago(v.created_at) },
         { label: "", render: (v) => {
           const p = versionPayloads[v.version];
-          if (!admin || !p) return "";
+          const restore = actionButton("Restore as new draft", async () => {
+            const r = await api("POST", `/agents/${id}/versions/${v.version}/restore`);
+            toast(`Version ${v.version} copied as version ${r.version}. Test it before release.`); go(`#/agents/${id}/tests/v${r.version}`);
+          }, { small: true });
+          if (!admin || !p) return v.version !== base.version ? restore : "";
           return h("div", { class: "row" },
+            p.simulated_results_block ? h("span", { class: "small muted", text: "Re-test with the real model first" }) : null,
             p.can_approve ? actionButton("Approve", async () => { await api("POST", `/agents/${id}/versions/${v.version}/approve`, { note: note.value }); toast(`Version ${v.version} approved`); render(); }, { small: true }) : null,
             p.can_deploy ? actionButton(deployed && v.version < deployed ? "Roll back to this" : "Deploy", async () => { await api("POST", `/agents/${id}/deploy`, { version: v.version }); toast(`Version ${v.version} deployed`); render(); }, { small: true, kind: "primary" }) : null,
+            v.version !== base.version ? restore : null,
             v.version === deployed ? actionButton("Undeploy", async () => { await api("POST", `/agents/${id}/undeploy`); toast("Agent undeployed"); render(); }, { small: true, kind: "danger", confirmText: "Confirm undeploy" }) : null);
         } },
       ], base.versions)]),
@@ -769,29 +832,44 @@ async function pageRuns() {
   ];
 }
 
-async function pageRun({ params: [id] }) {
+async function pageRun({ params: [id], isCurrent }) {
   const run = await api("GET", `/runs/${id}`);
   return [
-    pageHead(`Run #${run.id}`, null, [statusBadge(run.status), sourceBadge(run.source)], h("a", { href: "#/runs", text: "Execution history" })),
-    runDetail(run),
+    pageHead(`Run #${run.id}`, null, [statusBadge(run.status), sourceBadge(run.source), simBadge(run)], h("a", { href: "#/runs", text: "Execution history" })),
+    runDetail(run, { isCurrent }),
   ];
 }
 
-function runDetail(run, { compact = false } = {}) {
+function runDetail(run, { compact = false, isCurrent = () => true } = {}) {
   const steps = run.events.filter((e) => !["run_started"].includes(e.event));
+  const diagBox = h("div");
+  const fixBox = h("div");
+  const caseBox = h("div");
+  api("GET", `/runs/${run.id}/diagnosis`).then((f) => setChildren(diagBox, findingsView(f))).catch(() => {});
   return h("div", { class: "stack" },
+    run.simulated ? notice("warn", h("b", { text: "Simulated run." }), "A scripted test model made the decisions in this run, not a real AI model. The tools, data and rules were real.") : null,
     run.sandbox ? notice("info", "Sandbox run: it used a copy of the data. External APIs were simulated and no real action was taken.") : null,
     run.error ? notice("bad", h("b", { text: "Error" }), run.error) : null,
     card(compact ? h("h2", {}, "Run ", h("a", { href: `#/runs/${run.id}`, text: `#${run.id}` })) : "Summary", null, [kv([
       ["Agent", h("a", { href: `#/agents/${run.agent_id}`, text: run.agent })], ["Version", `v${run.version}`],
+      ["Model provider", run.provider ? (run.simulated ? `${run.provider} (simulated)` : run.provider) : "—"],
       ["Started", fmt.date(run.created_at)], ["Duration", fmt.ms(run.duration_ms)],
-      ["Outcome", run.stop_reason || "running"], ["Tokens", `${run.input_tokens.toLocaleString()} in · ${run.output_tokens.toLocaleString()} out`],
-      ["Model cost", fmt.usd(run.cost_usd)]])]),
+      ["Outcome", run.stop_reason || "running"], ["Tokens", `${run.input_tokens.toLocaleString()} in · ${run.output_tokens.toLocaleString()} out (provider-reported)`],
+      ["Estimated cost", `${fmt.usd(run.cost_usd)} (list prices)`]])]),
     card("Task", null, [h("pre", { text: run.input })]),
-    card("What the agent did", `${steps.filter((e) => e.event.startsWith("tool")).length} tool calls`, [h("div", { class: "timeline" },
+    card("What the agent did", `${steps.filter((e) => e.event.startsWith("tool")).length} tool steps`, [h("div", { class: "timeline" },
       steps.length ? steps.map(eventView) : h("p", { class: "muted", text: "No steps recorded." }))]),
     run.output ? card("Final answer", null, [h("pre", { text: run.output })]) : null,
-    run.actions.length ? card("Actions from this run that need approval", null, [actionsTable(run.actions)]) : null);
+    run.actions.length ? card("Actions from this run that need approval", null, [actionsTable(run.actions)]) : null,
+    card("Diagnosis", "What the platform recorded, and what to do about it.", [diagBox,
+      h("div", { class: "row" },
+        actionButton("Propose a fix", () => proposeFix(run.agent_id, run.version, { run_id: run.id }, fixBox, isCurrent), { small: true, ...needsModel() }),
+        h("button", { class: "small", type: "button", onclick: () => setChildren(caseBox, card("Turn this run into a test case", "Describe the correct result; the case is added to a new version of the agent.", [
+          testCaseForm([], { input: run.input, name: `from run ${run.id}`, submitLabel: "Save as new version", onSave: async (c) => {
+            const r = await api("POST", `/agents/${run.agent_id}/versions/${run.version}/test-cases`, { cases: [c] });
+            toast(`Saved as version ${r.version}. Run its tests next.`); go(`#/agents/${run.agent_id}/tests/v${r.version}`);
+          } })])) }, "Turn into a test case")),
+      fixBox, caseBox]));
 }
 
 function eventView(e) {
@@ -810,6 +888,10 @@ function eventView(e) {
     return h("div", { class: `event${d.decision === "queued" ? " wait" : ""}` }, h("div", { class: "head" },
       h("div", { class: "row" }, h("b", { text: `Approval for ${d.tool}` }), statusBadge(d.decision)),
       h("span", { class: "small muted", text: fmt.date(e.created_at) })), h("pre", { text: fmt.json(d.input) }));
+  }
+  if (e.event === "tool_repeat_skipped") {
+    return h("div", { class: "event" }, h("div", { class: "row" }, h("b", { text: d.tool }), badge("not repeated", "info")),
+      h("p", { class: "small muted", text: "Already done in an earlier attempt of this job, so it was not run again." }));
   }
   if (e.event === "tool_blocked") {
     return h("div", { class: "event err" }, h("b", { text: `Blocked: ${d.tool} is not one of this agent's tools` }));
@@ -858,13 +940,17 @@ async function pageMonitoring() {
   const m = await api("GET", "/monitoring?days=30");
   const share = m.monthly_budget_usd ? m.month_spend_usd / m.monthly_budget_usd : 0;
   return [
-    pageHead("Monitoring", "Last 30 days, from recorded runs and model calls."),
-    card("Model spend this month", "Every model call is metered: requirements analysis, generation, tests and agent runs. New calls stop when the budget is used up.", [
-      h("div", { class: "bar-label" }, h("span", { text: `${fmt.usd(m.month_spend_usd)} spent` }), h("span", { text: `budget ${fmt.usd(m.monthly_budget_usd)}` })),
+    pageHead("Monitoring", "Last 30 days, from recorded runs and model calls. Token counts are reported by the model provider; costs are estimates at list prices."),
+    card(m.simulated ? "Test-mode model usage this month" : "Model spend this month (estimated)",
+      "Every model call is metered: requirements analysis, generation, tests, fixes and agent runs. New calls stop before they would exceed the budget.", [
+      m.simulated ? notice("warn", "Test mode: these figures come from the scripted test model and are not real spend.") : null,
+      h("div", { class: "bar-label" }, h("span", { text: `${fmt.usd(m.month_spend_usd)} estimated` }), h("span", { text: `budget ${fmt.usd(m.monthly_budget_usd)}` })),
       progress(share, share >= 1 ? "bad" : share >= 0.8 ? "warn" : ""),
-      table([{ label: "Purpose", key: "purpose" }, { label: "Calls", key: "calls" },
+      table([{ label: "Purpose", key: "purpose" },
+        { label: "Provider", render: (u) => h("span", { class: "row" }, u.provider, u.simulated ? badge("simulated", "warn") : null) },
+        { label: "Calls", key: "calls" },
         { label: "Input tokens", render: (u) => fmt.tokens(u.input_tokens) }, { label: "Output tokens", render: (u) => fmt.tokens(u.output_tokens) },
-        { label: "Cost", render: (u) => fmt.usd(u.usd) }], m.usage, { empty: "No model calls in this period." })]),
+        { label: "Est. cost", render: (u) => fmt.usd(u.usd) }], m.usage, { empty: "No model calls in this period." })]),
     card("Agents", null, [table([
       { label: "Agent", class: "nowrap", render: (a) => h("a", { href: `#/agents/${a.id}/activity`, text: a.agent }) },
       { label: "Deployed", render: (a) => a.deployed_version ? `v${a.deployed_version}` : "—" },
@@ -873,7 +959,7 @@ async function pageMonitoring() {
       { label: "Tool errors", render: (a) => fmt.pct(a.tool_error_rate) },
       { label: "Approvals", render: (a) => Object.entries(a.approvals).map(([k, v]) => `${k} ${v}`).join(", ") || "—" },
       { label: "Waiting", key: "pending_actions" }, { label: "Avg duration", render: (a) => fmt.ms(a.avg_duration_ms) },
-      { label: "Cost", render: (a) => fmt.usd(a.cost_usd) },
+      { label: "Est. cost", render: (a) => fmt.usd(a.cost_usd) },
     ], m.agents, { empty: "No agents yet." })]),
     card("Failed background jobs", null, [table([
       { label: "Job", render: (j) => `#${j.id}` }, { label: "Source", render: (j) => sourceBadge(j.source) },
@@ -950,27 +1036,41 @@ async function pageSettings() {
   const s = await api("GET", "/settings");
   const admin = isAdmin();
   const users = admin ? await api("GET", "/users") : [];
+  const m = s.model;
   const budget = h("input", { type: "number", id: "budget", min: 0, step: 1, value: s.monthly_budget_usd, disabled: !admin });
+  const checkBox = h("div");
   const nu = { name: h("input", { type: "text", id: "nu-name" }), email: h("input", { type: "email", id: "nu-email" }),
     password: h("input", { type: "password", id: "nu-password", autocomplete: "new-password" }),
     role: h("select", { id: "nu-role" }, h("option", { value: "member", text: "Member" }), h("option", { value: "admin", text: "Administrator" })) };
   return [
     pageHead("Settings"),
-    card("Model provider", null, [kv([
-      ["API key", s.model_configured ? badge("configured on the server", "ok") : badge("not configured", "bad")],
-      ["Default model", s.default_model],
-      ["How to configure", "Set ANTHROPIC_API_KEY in the server's environment and restart. The key is never sent to the browser."]])]),
-    card("Spending limit", "A monthly cap on model spend for your organisation. When it is reached, new model calls are refused until you raise it or the month ends.", [
-      h("div", { class: "bar-label" }, h("span", { text: `${fmt.usd(s.month_spend_usd)} spent this month` }), h("span", { text: `budget ${fmt.usd(s.monthly_budget_usd)}` })),
+    card("AI model provider", "The platform talks to the model through a replaceable provider. The API key lives only on the server and is never shown or sent to the browser.", [
+      m.simulated ? notice("warn", h("b", { text: "Test mode." }), "A scripted test model is plugged in instead of a real provider. Nothing it produces reflects real AI performance.") : null,
+      kv([
+        ["Provider", m.simulated ? `${m.provider} (scripted test model)` : "Anthropic Claude API (official Python SDK)"],
+        ["API key", m.simulated ? badge("not used in test mode") : (m.api_key_configured ? badge("configured on the server", "ok") : badge("not configured", "bad"))],
+        ["Default model", h("code", { text: m.default_model })],
+        ["Test grader model", h("code", { text: m.grader_model })],
+        ["Request timeout", `${m.timeout_seconds} s`], ["Automatic retries", `${m.max_retries} (rate limits, overloads, connection errors)`],
+        m.unpriced_models.length ? ["Pricing", `No list price known for ${m.unpriced_models.join(", ")}; cost estimates use the default model's prices.`] : null,
+        ["How to configure", "Set ANTHROPIC_API_KEY (and optionally AGENTGEN_DEFAULT_MODEL, AGENTGEN_GRADER_MODEL, AGENTGEN_MODEL_TIMEOUT_SECONDS) in the server's environment and restart. See docs/DEPLOYMENT.md."]]),
+      admin ? h("div", { class: "row" }, actionButton("Check connection", async () => {
+        const r = await api("POST", "/settings/check-model");
+        setChildren(checkBox, notice(r.ok ? "ok" : "bad", h("b", { text: r.ok ? "Connection works" : "Connection failed" }), r.message,
+          m.simulated ? null : h("span", { class: "small", text: "This check uses the Models API and costs no tokens." })));
+      }), checkBox) : null]),
+    card("Spending limit", "A monthly cap on estimated model spend for your organisation. A call that would exceed it is refused before it is sent, until you raise the cap or the month ends.", [
+      h("div", { class: "bar-label" }, h("span", { text: `${fmt.usd(s.month_spend_usd)} ${m.simulated ? "used in test mode" : "estimated spend"} this month` }), h("span", { text: `budget ${fmt.usd(s.monthly_budget_usd)}` })),
       progress(s.monthly_budget_usd ? s.month_spend_usd / s.monthly_budget_usd : 0),
+      kv([["Real model usage", fmt.usd(s.month_spend_real_usd)], ["Simulated (test mode)", fmt.usd(s.month_spend_simulated_usd)]]),
       h("div", { class: "row" }, field("Monthly budget (USD)", budget),
         admin ? actionButton("Save budget", async () => { await api("PUT", "/settings", { monthly_budget_usd: Number(budget.value) }); toast("Budget saved"); render(); }) : null),
-      h("p", { class: "small muted", text: "Costs use list prices per million tokens; prompt caching makes real costs somewhat lower." })]),
+      h("p", { class: "small muted", text: "Estimates use list prices and the token counts reported by the provider; your invoice can differ (for example with prompt caching)." })]),
     card("Background worker", "Runs deployed agents' schedules, events and follow-ups on this server.", [kv([
       ["Status", s.worker.enabled ? (s.worker.running ? badge("running", "ok") : badge("stopped", "warn")) : badge("disabled")],
       ["Checks every", `${s.worker.poll_seconds} s`], ["Last check", fmt.ago(s.worker.last_tick)],
       s.worker.last_error ? ["Last error", s.worker.last_error] : null])]),
-    card("Secrets for external APIs", "Agents refer to secrets by name (for example CRM_TOKEN). The server reads them from environment variables scoped to your organisation, so agents can never reach other organisations' or the platform's credentials.", [
+    card("Secrets for external APIs", "Agents refer to secrets by name (for example CRM_TOKEN). The server reads them from environment variables scoped to your organisation, so agents can never reach other organisations' or the platform's own credentials.", [
       kv([["Variable prefix", h("code", { text: `${s.secret_prefix}<NAME>` })]])]),
     admin ? card("Team", "People in your organisation. Administrators can approve, deploy and change settings.", [
       table([{ label: "Name", key: "name" }, { label: "Email", key: "email" }, { label: "Role", render: (u) => badge(u.role) }, { label: "Added", render: (u) => fmt.date(u.created_at) }], users),
@@ -981,6 +1081,98 @@ async function pageSettings() {
         render();
       }))]) : null,
   ];
+}
+
+function needsModel() {
+  return state.me?.model_configured ? {} : { disabled: true, title: "Needs the model API key on the server" };
+}
+
+function genBadge(label) {
+  if (!label) return null;
+  return label.includes("simulated") ? badge("scripted test model", "warn") : badge(`by ${label}`, "info");
+}
+
+function simBadge(row) {
+  return row.simulated ? badge("simulated", "warn") : null;
+}
+
+function findingsView(findings) {
+  if (!findings || !findings.length) return null;
+  const kind = { error: "bad", warning: "warn", info: "info" };
+  return h("div", { class: "stack" }, findings.map((f) => h("div", { class: `finding ${f.severity}` },
+    h("div", { class: "row" }, badge(f.severity, kind[f.severity]), h("b", { text: f.title })),
+    f.detail && f.detail !== f.title ? h("p", { class: "small", text: f.detail }) : null,
+    h("p", { class: "small muted", text: `What to do: ${f.suggestion}` }))));
+}
+
+const CATEGORIES = ["task", "quality", "tool_use", "missing_info", "permission", "unauthorized_action", "api_failure", "edge_case"];
+
+// A form that creates a test case; onSave(case) gets the API body.
+
+function testCaseForm(toolNames, { input = "", name = "", category = "task", expected = "", submitLabel = "Add test case", onSave }) {
+  const f = {
+    name: h("input", { type: "text", value: name, placeholder: "e.g. total revenue is correct" }),
+    category: h("select", {}, CATEGORIES.map((c) => h("option", { value: c, selected: c === category, text: c.replaceAll("_", " ") }))),
+    input: h("textarea", { rows: 3, value: input, placeholder: "The task or message the agent receives" }),
+    expected: h("textarea", { rows: 2, value: expected, placeholder: "What a correct response does" }),
+    mustInclude: h("input", { type: "text", placeholder: "e.g. 20651 (comma-separated)" }),
+    mustNotInclude: h("input", { type: "text", placeholder: "text that must never appear (comma-separated)" }),
+    mustCall: h("select", { multiple: true, size: Math.min(5, toolNames.length || 1) }, toolNames.map((t) => h("option", { value: t, text: t }))),
+    mustNotCall: h("select", { multiple: true, size: Math.min(5, toolNames.length || 1) }, toolNames.map((t) => h("option", { value: t, text: t }))),
+  };
+  const split = (v) => v.split(",").map((x) => x.trim()).filter(Boolean);
+  const picked = (sel) => [...sel.selectedOptions].map((o) => o.value);
+  const msg = h("div");
+  const form = h("form", { class: "stack" },
+    h("div", { class: "form-grid" },
+      field("Name", f.name), field("Category", f.category),
+      h("div", { class: "full" }, field("Input", f.input)),
+      h("div", { class: "full" }, field("Expected behaviour", f.expected, "the grader checks this")),
+      field("Answer must contain", f.mustInclude, "exact, checked without a model"),
+      field("Answer must not contain", f.mustNotInclude),
+      field("Must use tools", f.mustCall, "hold Ctrl/Cmd to pick several"),
+      field("Must not use tools", f.mustNotCall)),
+    msg,
+    h("div", { class: "row" }, h("button", { class: "primary", type: "submit" }, submitLabel)));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    msg.replaceChildren();
+    try {
+      await onSave({
+        name: f.name.value.trim(), category: f.category.value, input: f.input.value.trim(), expected_behavior: f.expected.value.trim(),
+        must_include: split(f.mustInclude.value), must_not_include: split(f.mustNotInclude.value),
+        must_call: picked(f.mustCall), must_not_call: picked(f.mustNotCall), fail_tools: [], fixtures: [],
+      });
+    } catch (err) { msg.replaceChildren(notice("bad", err.message)); }
+  });
+  return form;
+}
+
+// Shows a model-proposed fix with an Apply button that creates a new version.
+
+function proposalView(agentId, version, result) {
+  const p = result.proposal;
+  return card(h("h2", {}, "Proposed fix ", genBadge(result.generated_by)), "Nothing changes until you apply it. Applying creates a new draft version that must pass its tests, including the new regression test.", [
+    kv([["Diagnosis", p.diagnosis], ["Changes", list(p.changes)],
+      ["New limits", [p.max_turns ? `max turns ${p.max_turns}` : "", p.max_tokens_per_run ? `token budget ${p.max_tokens_per_run}` : ""].filter(Boolean).join(", ") || "unchanged"],
+      ["Regression test", `${p.regression_test.name}: ${p.regression_test.expected_behavior}`]]),
+    p.instructions ? h("details", {}, h("summary", { text: "Revised instructions" }), h("pre", { text: p.instructions })) : null,
+    h("div", { class: "row" }, actionButton("Apply as new version", async () => {
+      const r = await api("POST", `/agents/${agentId}/versions/${version}/apply-fix`, { proposal: p });
+      toast(`Saved as version ${r.version}. Run its tests next.`);
+      go(`#/agents/${agentId}/tests/v${r.version}`);
+    }, { kind: "primary" })),
+  ]);
+}
+
+// Starts a propose-fix operation and renders the proposal into `box`.
+
+async function proposeFix(agentId, version, body, box, isCurrent) {
+  let op = await api("POST", `/agents/${agentId}/versions/${version}/propose-fix`, body);
+  op = await waitForOperation(op, (o) => setChildren(box, operationView(o, "Proposing a fix")), isCurrent);
+  if (!isCurrent()) return;
+  if (op.status === "failed") { setChildren(box, operationView(op, "Proposing a fix")); return; }
+  setChildren(box, proposalView(agentId, version, op.result));
 }
 
 boot();

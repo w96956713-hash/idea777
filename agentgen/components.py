@@ -78,6 +78,22 @@ def _check_public_host(host: str) -> None:
             raise ToolFailure(f"requests to internal network addresses are not allowed ({host})")
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Redirects are never followed: the new address would skip the internal-network check and
+    would receive the request's credentials. The API's 3xx answer is reported instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirects)
+
+
+def http_open(request: urllib.request.Request, timeout: float):
+    """Send one HTTP request for an agent's API tool (the single place tests replace)."""
+    return _opener.open(request, timeout=timeout)
+
+
 def _schema(properties: dict, required: list[str] | None = None) -> dict:
     return {
         "type": "object",
@@ -196,7 +212,10 @@ class QueryData(Component):
         return f"{self.summary}\nTables:\n{tables}"
 
     def run(self, args, ctx):
-        return datasets.query(ctx.store, ctx.customer_id, _csv(ctx.config.get("datasets", "")), args["sql"])
+        out = datasets.query(ctx.store, ctx.customer_id, _csv(ctx.config.get("datasets", "")), args["sql"])
+        if out.startswith("Error: "):
+            raise ToolFailure(out[len("Error: "):])  # reported to the model as a tool error
+        return out
 
 
 class SearchRecords(Component):
@@ -230,7 +249,8 @@ class CreateRecord(Component):
 
     def run(self, args, ctx):
         data = _parse_json_object(args["fields_json"], "fields_json")
-        missing = [f for f in _csv(ctx.config.get("required_fields", "")) if f not in data or data[f] in ("", None)]
+        missing = [f for f in _csv(ctx.config.get("required_fields", ""))
+                   if f not in data or data[f] is None or (isinstance(data[f], str) and not data[f].strip())]
         if missing:
             raise ToolFailure(f"missing required fields: {', '.join(missing)}")
         record_id = ctx.store.add_record(ctx.agent_id, ctx.config["record_type"], data)
@@ -283,6 +303,7 @@ class HttpRequest(Component):
         "effect": "read, write_external or financial. Defaults to read for GET, write_external otherwise.",
         "description": "What the endpoint does and returns.",
         "timeout_seconds": "Request timeout (default 15).",
+        "sandbox_response": "Simulated response returned in sandbox runs (the real API is never called there).",
     }
     required_config = ("base_url", "method", "path")
     strict = False  # the parameter schema is endpoint-specific
@@ -357,6 +378,9 @@ class HttpRequest(Component):
 
     def run(self, args, ctx):
         if ctx.sandbox:
+            simulated = ctx.config.get("sandbox_response", "")
+            if simulated:
+                return f"[Simulated response - sandbox, the real API was not called]\n{simulated}"
             raise ToolFailure("sandbox: this external API was not called (no simulated response is configured); "
                               "sandbox runs and tests never call real systems")
         cfg = ctx.config
@@ -366,10 +390,14 @@ class HttpRequest(Component):
         retries = 2 if request.get_method() == "GET" else 0  # only retry idempotent reads
         for attempt in range(retries + 1):
             try:
-                with urllib.request.urlopen(request, timeout=timeout) as resp:
+                with http_open(request, timeout=timeout) as resp:
                     body = resp.read(20000).decode("utf-8", "replace")
                     return f"HTTP {resp.status}\n{body[:8000]}"
             except urllib.error.HTTPError as e:
+                if 300 <= e.code < 400:
+                    raise ToolFailure(f"the API answered with a redirect (HTTP {e.code} to "
+                                      f"{(e.headers or {}).get('Location', '?')}); redirects are not followed. "
+                                      "Configure the tool with the final address.")
                 if e.code >= 500 and attempt < retries:
                     time.sleep(0.5 * 2 ** attempt)
                     continue
@@ -379,6 +407,9 @@ class HttpRequest(Component):
                 if attempt < retries:
                     time.sleep(0.5 * 2 ** attempt)
                     continue
+                if request.get_method() != "GET" and isinstance(getattr(e, "reason", e), TimeoutError):
+                    raise ToolFailure("the request timed out; the external system may or may not have processed "
+                                      "it. Do not repeat it - escalate so a person can check.")
                 raise ToolFailure(f"API unreachable: {e}")
 
 
