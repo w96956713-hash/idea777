@@ -836,8 +836,9 @@ def create_app(db_path: str | None = None, client_factory=None, default_budget_u
         events = []
         for e in st.run_events(run_id):
             events.append({"event": e["event"], "data": json.loads(e["data_json"]), "created_at": e["created_at"]})
-        actions = [dict(a) for a in st.conn.execute("SELECT * FROM pending_actions WHERE run_id = ? ORDER BY id",
-                                                    (run_id,))]
+        actions = [dict(a) for a in st.conn.execute(
+            """SELECT p.*, a.name AS agent FROM pending_actions p JOIN agents a ON a.id = p.agent_id
+               WHERE p.run_id = ? ORDER BY p.id""", (run_id,))]
         return {**run_row(st, r, {}), "input": r["input"], "output": r["output"], "events": events,
                 "actions": actions, "sandbox": r["trigger_source"] == "sandbox"}
 

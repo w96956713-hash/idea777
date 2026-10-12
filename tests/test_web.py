@@ -181,6 +181,7 @@ def test_sensitive_action_needs_approval_in_live_runs(tmp_path):
     assert not [e for e in run["events"] if e["event"] == "tool_call" and e["data"]["tool"] == "send_report"]
     [action] = ok(c.get("/api/approvals"))["actions"]
     assert action["tool"] == "send_report" and action["run_id"] == live["run_id"]
+    assert run["actions"][0]["agent"] == action["agent"] == "nordhem-design-sales-reporter"
 
     # a member can't approve; an admin can, and only then does the action happen
     ok(c.post("/api/users", json={"name": "Olle", "email": "olle@nordhem.se", "password": "another long pass",

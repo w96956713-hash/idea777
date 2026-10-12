@@ -821,7 +821,7 @@ function eventView(e) {
 
 // ---------------------------------------------------------------- approvals
 
-function actionsTable(actions) {
+function actionsTable(actions, empty = "Nothing is waiting for approval.") {
   return table([
     { label: "Action", render: (a) => `#${a.id}` },
     { label: "Agent", key: "agent" },
@@ -834,7 +834,7 @@ function actionsTable(actions) {
         actionButton("Approve", async () => { const r = await api("POST", `/approvals/actions/${a.id}`, { decision: "approve" }); toast(`Done: ${r.result}`); render(); }, { small: true, kind: "primary" }),
         actionButton("Deny", async () => { await api("POST", `/approvals/actions/${a.id}`, { decision: "deny" }); toast("Denied"); render(); }, { small: true, kind: "danger" }))
         : badge("admin approval needed", "warn") },
-  ], actions, { empty: "Nothing is waiting for approval." });
+  ], actions, { empty });
 }
 
 async function pageApprovals() {
@@ -848,7 +848,7 @@ async function pageApprovals() {
       { label: "Version", render: (v) => `v${v.version}` }, { label: "Tests", render: (v) => fmt.pct(v.pass_rate) },
       { label: "Created", render: (v) => fmt.ago(v.created_at) },
     ], a.versions, { empty: "No versions waiting." })]),
-    card("Recently decided", null, [actionsTable(a.decided)]),
+    card("Recently decided", null, [actionsTable(a.decided, "No actions have been decided yet.")]),
   ];
 }
 
